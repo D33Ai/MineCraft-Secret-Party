@@ -39,7 +39,13 @@ jobs:
           cp index.html _site/index.html
           touch _site/.nojekyll
 
+      # enablement: true lets the workflow create the Pages site itself via the
+      # API, instead of the deploy failing with "Get Pages site failed" until
+      # someone flips Settings -> Pages -> Source: GitHub Actions by hand.
+      # It is a no-op once Pages exists.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
