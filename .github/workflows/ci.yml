@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'      # Mondays: check the CDN mirrors are still serving
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: build + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Static gates
+        run: npm run check      # node --check, index.html in sync with src/, DOM ids, CDN mirrors
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Offline: the cached engine makes the gate deterministic, so a CDN
+      # hiccup can never fail an unrelated pull request. The `mirrors` job
+      # below is what watches the real CDNs.
+      - name: Headless gate battery (desktop + mobile)
+        run: npm run test:offline
+
+  mirrors:
+    name: CDN mirrors
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every mirror in the loader must serve the pinned three.js
+        run: |
+          set -euo pipefail
+          version=$(grep -oE 'three@[0-9]+\.[0-9]+\.[0-9]+' src/game.mjs | head -1 | cut -d@ -f2)
+          echo "pinned three.js: $version"
+          fail=0
+          for url in \
+            "https://esm.sh/three@$version" \
+            "https://cdn.jsdelivr.net/npm/three@$version/build/three.module.js" \
+            "https://unpkg.com/three@$version/build/three.module.js"; do
+            code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$url" || echo 000)
+            echo "$code  $url"
+            [ "$code" = "200" ] || fail=1
+          done
+          exit $fail

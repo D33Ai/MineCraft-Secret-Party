@@ -1,0 +1,6672 @@
+/* =====================================================================
+   ATOLL, Voxel Archipelago  |  D33 AI Labs  |  v2.0
+   Tier 1 real-time build. Three.js r0.180 (multi-CDN self-healing).
+   Colour lane: STYLIZED. Baked vertex lighting (AO + skylight + depth
+   attenuation) with a directional sun term on top, HDR bloom and a
+   filmic grade in the post pass. Deliberate deviation from the AgX
+   photoreal lane: a stylized voxel aesthetic, not a photoreal water sim.
+   Water is cosmetic kinematics.
+
+   v2.0: spawn on the Aerie (a floating ledge at the top of the world),
+   glider descent, objectives, compass and minimap, sun-direction face
+   shading, stars and moon, shoreline foam, underwater caustics, seabirds,
+   reef fish, fireflies, broadleaf trees and outcrops, a reef lighthouse,
+   quality presets with adaptive resolution, per-seed build persistence,
+   strobe safety switch, photo mode, gamepad, ambient wind and surf.
+   ===================================================================== */
+
+const VERSION = 'v2.0';
+const CDN = [
+  'https://esm.sh/three@0.180.0',
+  'https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js',
+  'https://unpkg.com/three@0.180.0/build/three.module.js'
+];
+
+const $ = (id) => document.getElementById(id);
+const isTouch = window.matchMedia('(pointer: coarse)').matches;
+
+/* URL hash parameters: #seed=123&q=low&t=0.8&test=1 */
+const HASHP = new URLSearchParams(location.hash.replace(/^#/, ''));
+const TESTMODE = HASHP.get('test') === '1';
+
+/* Browser storage, guarded: private windows, file:// quirks and quota errors all
+   degrade to "nothing persists" instead of an exception mid-frame. */
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('atoll.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('atoll.' + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem('atoll.' + k); } catch (e) { } }
+};
+const settings = Object.assign({
+  quality: 'auto', renderDist: null, gfx: true, sound: true, strobe: true, map: true, cycle: true
+}, store.get('settings', {}) || {});
+function saveSettings() { store.set('settings', settings); }
+
+/* Quality presets. Auto picks a preset by device class and then scales the
+   render resolution to hold frame time; the presets also size the crowd and the
+   analytic particle systems, which is where the fill-rate goes. */
+const QP = {
+  low:    { crowd: 2500,  dprCap: 1.0, post: false, msaa: 0, rd: 5, fx: 0.45, birds: 14, fish: 320,  flies: 220, label: 'Low' },
+  medium: { crowd: 6000,  dprCap: 1.5, post: true,  msaa: 0, rd: 7, fx: 0.75, birds: 26, fish: 720,  flies: 420, label: 'Medium' },
+  high:   { crowd: 12000, dprCap: 2.0, post: true,  msaa: 4, rd: 9, fx: 1.0,  birds: 40, fish: 1200, flies: 640, label: 'High' }
+};
+if (HASHP.get('q') && QP[HASHP.get('q')]) settings.quality = HASHP.get('q');
+if (HASHP.get('q') === 'auto') settings.quality = 'auto';
+function resolveQuality() {
+  const base = settings.quality !== 'auto' && QP[settings.quality] ? QP[settings.quality] : (isTouch ? QP.medium : QP.high);
+  const q = Object.assign({}, base);
+  if (TESTMODE) { q.crowd = 500; q.post = false; q.dprCap = 1; q.msaa = 0; q.fish = 200; q.birds = 12; q.flies = 120; }
+  return q;
+}
+let Q = resolveQuality();
+
+function fault(title, detail) {
+  const el = $('fault');
+  $('faultTitle').textContent = title;
+  $('faultBody').textContent = detail;
+  el.style.display = 'flex';
+  $('boot').style.display = 'none';
+}
+window.__atollBooted = false;
+setTimeout(() => {
+  if (!window.__atollBooted) {
+    fault('Boot timed out',
+      'The 3D engine did not start within 40 seconds. Most likely cause: no network access to a CDN, or WebGL2 is disabled. Try another browser, or reload with a connection available.');
+  }
+}, 40000);
+/* Runtime errors after boot must not blank a working world: surface them in
+   the HUD and keep the frame loop alive. Before boot they are fatal. */
+window.addEventListener('error', (e) => {
+  if (!window.__atollBooted) fault('Startup error', String(e.message || e.error || e));
+  else if (typeof toast === 'function') { toast('Runtime error: ' + String(e.message).slice(0, 80)); console.error('ATOLL runtime error', e.error || e.message); }
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const m = e.reason && e.reason.message ? e.reason.message : String(e.reason);
+  if (!window.__atollBooted) fault('Startup error', m);
+  else if (typeof toast === 'function') { toast('Runtime error: ' + m.slice(0, 80)); console.error('ATOLL unhandled rejection', e.reason); }
+});
+const bootMsg = (m, f) => { const el = $('bootMsg'); if (el) el.textContent = m; if (f !== undefined) { const b = $('bootFill'); if (b) b.style.width = Math.round(f * 100) + '%'; } };
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+
+async function loadThree() {
+  let last;
+  for (const url of CDN) {
+    try {
+      const m = await import(/* webpackIgnore: true */ url);
+      if (m && m.WebGLRenderer) return m;
+      last = new Error('module loaded but incomplete: ' + url);
+    } catch (e) { last = e; }
+  }
+  throw last || new Error('all CDNs failed');
+}
+
+let THREE;
+try {
+  bootMsg('loading engine…', 0.05);
+  THREE = await loadThree();
+} catch (e) {
+  fault('Could not load the 3D engine', 'All three CDN mirrors failed.\n\n' + (e && e.message ? e.message : String(e)));
+  throw e;
+}
+
+/* ==================== constants ==================== */
+const CS = 16;            // chunk size (x,z)
+const WH = 264;           // world height: canopy city, the rave stack and the Aerie above it all
+const SEA = 34;           // sea level
+const MAXY = WH - 1;
+
+const AIR = 0, STONE = 1, DIRT = 2, GRASS = 3, SAND = 4, SANDSTONE = 5, WATER = 6,
+  LOG = 7, LEAF = 8, COR_P = 9, COR_O = 10, COR_U = 11, COR_T = 12,
+  PLANK = 13, GLASS = 14, LANTERN = 15, BEDROCK = 16, BASALT = 17, THATCH = 18,
+  OBSIDIAN = 19, SPEAKER = 20, DECK = 21, NEON_M = 22, NEON_C = 23,
+  PORTAL = 24, ROPE = 25, LANT_P = 26, SHINGLE = 27, BANNER = 28,
+  LITGLASS = 29, AWNING = 30, ICE = 31, MAGMA = 32, SKYGLASS = 33;
+
+// atlas tile indices
+const T = {
+  stone: 0, dirt: 1, grassTop: 2, grassSide: 3, sand: 4, sandstone: 5, water: 6,
+  logSide: 7, logTop: 8, leaf: 9, corP: 10, corO: 11, corU: 12, corT: 13,
+  plank: 14, glass: 15, lantern: 16, bedrock: 17, basalt: 18, thatch: 19,
+  obsidian: 20, speaker: 21, deck: 22, neonM: 23, neonC: 24,
+  portal: 25, rope: 26, lantP: 27, shingle: 28, banner: 29,
+  litGlass: 30, awning: 31, ice: 32, magma: 33, skyGlass: 34
+};
+
+// pass: 0 = none, 1 = opaque, 2 = cutout, 3 = water
+const B = [];
+function def(id, o) { B[id] = o; }
+def(AIR, { name: 'Air', pass: 0, opaque: false, solid: false });
+def(STONE, { name: 'Stone', pass: 1, opaque: true, solid: true, t: [T.stone, T.stone, T.stone] });
+def(DIRT, { name: 'Dirt', pass: 1, opaque: true, solid: true, t: [T.dirt, T.dirt, T.dirt] });
+def(GRASS, { name: 'Island Grass', pass: 1, opaque: true, solid: true, t: [T.grassTop, T.dirt, T.grassSide] });
+def(SAND, { name: 'Sand', pass: 1, opaque: true, solid: true, t: [T.sand, T.sand, T.sand] });
+def(SANDSTONE, { name: 'Sandstone', pass: 1, opaque: true, solid: true, t: [T.sandstone, T.sandstone, T.sandstone] });
+def(WATER, { name: 'Water', pass: 3, opaque: false, solid: false, liquid: true, t: [T.water, T.water, T.water] });
+def(LOG, { name: 'Palm Log', pass: 1, opaque: true, solid: true, t: [T.logTop, T.logTop, T.logSide] });
+def(LEAF, { name: 'Palm Frond', pass: 2, opaque: false, solid: true, t: [T.leaf, T.leaf, T.leaf] });
+def(COR_P, { name: 'Pink Coral', pass: 1, opaque: true, solid: true, t: [T.corP, T.corP, T.corP] });
+def(COR_O, { name: 'Fire Coral', pass: 1, opaque: true, solid: true, t: [T.corO, T.corO, T.corO] });
+def(COR_U, { name: 'Violet Coral', pass: 1, opaque: true, solid: true, t: [T.corU, T.corU, T.corU] });
+def(COR_T, { name: 'Teal Coral', pass: 1, opaque: true, solid: true, t: [T.corT, T.corT, T.corT] });
+def(PLANK, { name: 'Planks', pass: 1, opaque: true, solid: true, t: [T.plank, T.plank, T.plank] });
+def(GLASS, { name: 'Glass', pass: 2, opaque: false, solid: true, t: [T.glass, T.glass, T.glass] });
+def(LANTERN, { name: 'Lantern', pass: 1, opaque: true, solid: true, glow: true, t: [T.lantern, T.lantern, T.lantern] });
+def(BEDROCK, { name: 'Bedrock', pass: 1, opaque: true, solid: true, t: [T.bedrock, T.bedrock, T.bedrock] });
+def(BASALT, { name: 'Basalt', pass: 1, opaque: true, solid: true, t: [T.basalt, T.basalt, T.basalt] });
+def(THATCH, { name: 'Thatch', pass: 1, opaque: true, solid: true, t: [T.thatch, T.thatch, T.thatch] });
+def(OBSIDIAN, { name: 'Obsidian', pass: 1, opaque: true, solid: true, t: [T.obsidian, T.obsidian, T.obsidian] });
+def(SPEAKER, { name: 'Speaker Stack', pass: 1, opaque: true, solid: true, t: [T.speaker, T.speaker, T.speaker] });
+def(DECK, { name: 'DJ Deck', pass: 1, opaque: true, solid: true, glow: true, t: [T.deck, T.speaker, T.speaker] });
+def(NEON_M, { name: 'Magenta Neon', pass: 1, opaque: true, solid: true, glow: true, t: [T.neonM, T.neonM, T.neonM] });
+def(NEON_C, { name: 'Cyan Neon', pass: 1, opaque: true, solid: true, glow: true, t: [T.neonC, T.neonC, T.neonC] });
+def(PORTAL, { name: 'Portal', pass: 2, opaque: false, solid: false, glow: true, portal: true, t: [T.portal, T.portal, T.portal] });
+def(ROPE, { name: 'Rope', pass: 2, opaque: false, solid: true, t: [T.rope, T.rope, T.rope] });
+def(LANT_P, { name: 'Paper Lantern', pass: 1, opaque: true, solid: true, glow: true, t: [T.lantP, T.lantP, T.lantP] });
+def(SHINGLE, { name: 'Shingle', pass: 1, opaque: true, solid: true, t: [T.shingle, T.shingle, T.shingle] });
+def(BANNER, { name: 'Banner', pass: 2, opaque: false, solid: false, t: [T.banner, T.banner, T.banner] });
+def(LITGLASS, { name: 'Lit Window', pass: 1, opaque: true, solid: true, glow: true, t: [T.litGlass, T.litGlass, T.litGlass] });
+def(AWNING, { name: 'Awning', pass: 1, opaque: true, solid: true, t: [T.awning, T.awning, T.awning] });
+def(ICE, { name: 'Frost Ice', pass: 1, opaque: true, solid: true, glow: true, t: [T.ice, T.ice, T.ice] });
+def(MAGMA, { name: 'Magma', pass: 1, opaque: true, solid: true, glow: true, t: [T.magma, T.magma, T.magma] });
+def(SKYGLASS, { name: 'Sky Glass', pass: 2, opaque: false, solid: true, t: [T.skyGlass, T.skyGlass, T.skyGlass] });
+
+const HOTBAR = [PLANK, LOG, LEAF, THATCH, SHINGLE, LANT_P, ICE, MAGMA, NEON_M, NEON_C];
+
+/* Flat lookup tables for the mesher's hot loop. Every face test and every AO
+   sample used to deref a block object and read a property; at ~60k lookups per
+   chunk that dominated meshing time. Typed-array indexing is the same logic
+   without the object hop. */
+const NBLOCK = 64;
+const OPAQUE_T = new Uint8Array(NBLOCK);
+const SOLID_T = new Uint8Array(NBLOCK);
+const PASS_T = new Uint8Array(NBLOCK);
+const GLOW_T = new Uint8Array(NBLOCK);
+const TILE_T = new Uint8Array(NBLOCK * 3);
+function rebuildBlockTables() {
+  for (let id = 0; id < NBLOCK; id++) {
+    const b = B[id];
+    OPAQUE_T[id] = b && b.opaque ? 1 : 0;
+    SOLID_T[id] = b && b.solid ? 1 : 0;
+    PASS_T[id] = b ? (b.pass | 0) : 0;
+    GLOW_T[id] = b && b.glow ? 1 : 0;
+    if (b && b.t) { TILE_T[id * 3] = b.t[0]; TILE_T[id * 3 + 1] = b.t[1]; TILE_T[id * 3 + 2] = b.t[2]; }
+  }
+}
+const isOpaque = (id) => OPAQUE_T[id] === 1;
+const isSolid = (id) => SOLID_T[id] === 1;
+
+rebuildBlockTables();
+
+/* ==================== noise ==================== */
+function makeNoise(seed) {
+  const perm = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) perm[i] = i;
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; };
+  for (let i = 255; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; const t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 512; i++) p[i] = perm[i & 255];
+
+  const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+  const lerp = (a, b, t) => a + t * (b - a);
+
+  function g2(h, x, y) {
+    switch (h & 3) {
+      case 0: return x + y; case 1: return -x + y; case 2: return x - y; default: return -x - y;
+    }
+  }
+  function g3(h, x, y, z) {
+    const u = h < 8 ? x : y;
+    const v = h < 4 ? y : (h === 12 || h === 14 ? x : z);
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+  }
+  function n2(x, y) {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    x -= Math.floor(x); y -= Math.floor(y);
+    const u = fade(x), v = fade(y);
+    const A = p[X] + Y, Bb = p[X + 1] + Y;
+    return lerp(
+      lerp(g2(p[A], x, y), g2(p[Bb], x - 1, y), u),
+      lerp(g2(p[A + 1], x, y - 1), g2(p[Bb + 1], x - 1, y - 1), u), v) * 0.72;
+  }
+  function n3(x, y, z) {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
+    x -= Math.floor(x); y -= Math.floor(y); z -= Math.floor(z);
+    const u = fade(x), v = fade(y), w = fade(z);
+    const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+    const Bb = p[X + 1] + Y, BA = p[Bb] + Z, BB = p[Bb + 1] + Z;
+    return lerp(
+      lerp(lerp(g3(p[AA], x, y, z), g3(p[BA], x - 1, y, z), u),
+        lerp(g3(p[AB], x, y - 1, z), g3(p[BB], x - 1, y - 1, z), u), v),
+      lerp(lerp(g3(p[AA + 1], x, y, z - 1), g3(p[BA + 1], x - 1, y, z - 1), u),
+        lerp(g3(p[AB + 1], x, y - 1, z - 1), g3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+  }
+  function fbm2(x, y, oct) {
+    let a = 1, f = 1, sum = 0, norm = 0;
+    for (let i = 0; i < oct; i++) { sum += a * n2(x * f, y * f); norm += a; a *= 0.5; f *= 2.02; }
+    return sum / norm;
+  }
+  return { n2, n3, fbm2 };
+}
+
+function hashi(x, y, s) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(s | 0, 362437);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+const rnd2 = (x, z, s) => hashi(x, z, s) / 4294967296;
+const smoothstep = (e0, e1, x) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+/* ==================== texture atlas (procedural, original art) ==================== */
+const TILE = 16, PAD = 8, CELL = TILE + PAD * 2, COLS = 8, ATLAS = CELL * COLS;
+
+function px(ctx, x, y, c) { ctx.fillStyle = c; ctx.fillRect(x, y, 1, 1); }
+function rgb(r, g, b) { return 'rgb(' + (r | 0) + ',' + (g | 0) + ',' + (b | 0) + ')'; }
+
+function drawTile(ctx, name, seedBase) {
+  const R = (i) => rnd2(i, seedBase, 7717);
+  const grain = (base, amp, mod) => {
+    for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+      const n = (R(y * 16 + x) - 0.5) * 2;
+      let r = base[0] + n * amp[0], g = base[1] + n * amp[1], b = base[2] + n * amp[2];
+      if (mod) { const m = mod(x, y, n); r += m[0]; g += m[1]; b += m[2]; }
+      px(ctx, x, y, rgb(clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255)));
+    }
+  };
+  switch (name) {
+    case 'stone': grain([124, 126, 130], [16, 16, 17]); break;
+    case 'dirt': grain([104, 78, 54], [16, 13, 10]); break;
+    case 'grassTop': grain([86, 148, 74], [16, 20, 14], (x, y, n) => n > 0.72 ? [10, 26, 4] : [0, 0, 0]); break;
+    case 'grassSide':
+      grain([104, 78, 54], [14, 11, 9]);
+      for (let x = 0; x < TILE; x++) {
+        const h = 3 + Math.floor(R(x * 3) * 3);
+        for (let y = 0; y < h; y++) px(ctx, x, y, rgb(80 + R(x * 5 + y) * 26, 140 + R(x * 7 + y) * 28, 68 + R(x * 11 + y) * 20));
+      }
+      break;
+    case 'sand': grain([226, 208, 168], [12, 12, 14]); break;
+    case 'sandstone':
+      grain([214, 194, 152], [9, 9, 10], (x, y) => (y % 8 === 0) ? [-16, -16, -14] : [0, 0, 0]); break;
+    case 'water': grain([38, 122, 158], [10, 14, 16]); break;
+    case 'logSide':
+      grain([120, 92, 60], [12, 10, 8], (x, y) => (x % 5 === 2) ? [-18, -14, -10] : [0, 0, 0]); break;
+    case 'logTop':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const d = Math.hypot(x - 7.5, y - 7.5);
+        const ring = Math.sin(d * 2.1) * 0.5 + 0.5;
+        px(ctx, x, y, rgb(150 - ring * 34, 118 - ring * 28, 78 - ring * 18));
+      }
+      break;
+    case 'leaf':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const r = R(y * 16 + x);
+        if (r < 0.16) { ctx.clearRect(x, y, 1, 1); continue; }
+        const v = r * 40;
+        px(ctx, x, y, rgb(44 + v * 0.5, 116 + v, 52 + v * 0.4));
+      }
+      break;
+    case 'corP': grain([214, 104, 142], [22, 20, 20], (x, y, n) => n > 0.6 ? [22, 18, 18] : [0, 0, 0]); break;
+    case 'corO': grain([226, 132, 62], [22, 20, 16], (x, y, n) => n > 0.6 ? [20, 16, 8] : [0, 0, 0]); break;
+    case 'corU': grain([150, 104, 200], [20, 20, 22], (x, y, n) => n > 0.6 ? [18, 14, 22] : [0, 0, 0]); break;
+    case 'corT': grain([72, 190, 178], [18, 20, 20], (x, y, n) => n > 0.6 ? [14, 20, 18] : [0, 0, 0]); break;
+    case 'plank':
+      grain([176, 140, 96], [10, 9, 8], (x, y) => (y % 4 === 3) ? [-26, -22, -16] : [0, 0, 0]); break;
+    case 'glass':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const edge = (x === 0 || y === 0 || x === TILE - 1 || y === TILE - 1);
+        if (edge) px(ctx, x, y, 'rgba(206,232,240,0.92)');
+        else if ((x + y) % 11 === 0) px(ctx, x, y, 'rgba(230,248,255,0.5)');
+        else ctx.clearRect(x, y, 1, 1);
+      }
+      break;
+    case 'lantern':
+      grain([248, 214, 132], [12, 16, 20], (x, y) => {
+        const edge = (x < 2 || y < 2 || x > 13 || y > 13);
+        return edge ? [-70, -60, -40] : [0, 0, 0];
+      });
+      break;
+    case 'bedrock': grain([62, 60, 66], [26, 26, 26]); break;
+    case 'basalt': grain([66, 64, 70], [12, 12, 13], (x, y) => (x % 6 === 0 || y % 7 === 0) ? [-14, -14, -14] : [0, 0, 0]); break;
+    case 'thatch':
+      grain([196, 168, 96], [14, 14, 12], (x, y) => (y % 3 === 0) ? [-22, -20, -14] : [0, 0, 0]); break;
+    case 'obsidian':
+      grain([28, 24, 40], [9, 8, 13], (x, y, n) => n > 0.86 ? [46, 40, 70] : [0, 0, 0]); break;
+    case 'speaker':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const d = Math.hypot(x - 7.5, y - 7.5);
+        const n = (R(y * 16 + x) - 0.5) * 12;
+        if (d < 5.2) { const v = 26 + d * 4 + n; px(ctx, x, y, rgb(v, v, v + 3)); }
+        else if (d < 6.3) px(ctx, x, y, rgb(84 + n, 84 + n, 90 + n));
+        else px(ctx, x, y, rgb(48 + n, 48 + n, 54 + n));
+      }
+      break;
+    case 'deck':
+      grain([34, 34, 40], [8, 8, 10], (x, y) => {
+        if (y >= 6 && y <= 8 && x >= 2 && x <= 13) return [10, 150, 170];
+        if (y === 3 && x % 3 === 1) return [120, 90, 30];
+        if (y === 12 && x >= 4 && x <= 11) return [70, 70, 78];
+        return [0, 0, 0];
+      });
+      break;
+    case 'portal':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const sw = Math.sin(x * 0.7 + y * 0.35) * 0.5 + 0.5;
+        const n = R(y * 16 + x);
+        const v = 0.42 + sw * 0.42 + n * 0.22;
+        px(ctx, x, y, rgb(236 * v + 18, 62 * v + 8, 168 * v + 22));
+      }
+      break;
+    case 'rope':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        if (x < 6 || x > 9) { ctx.clearRect(x, y, 1, 1); continue; }
+        const tw = (y % 4 < 2) ? 18 : -12;
+        px(ctx, x, y, rgb(150 + tw, 122 + tw, 78 + tw));
+      }
+      break;
+    case 'lantP':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const d = Math.max(Math.abs(x - 7.5), Math.abs(y - 7.5));
+        if (y < 2 || y > 13) px(ctx, x, y, rgb(96, 62, 40));
+        else px(ctx, x, y, rgb(250 - d * 3, 138 + d * 2, 96 + d * 3));
+      }
+      break;
+    case 'shingle':
+      grain([132, 92, 74], [10, 9, 8], (x, y) => {
+        const row = Math.floor(y / 4);
+        const off = (row % 2) * 4;
+        const edge = ((x + off) % 8 === 0) || (y % 4 === 0);
+        return edge ? [-30, -24, -18] : [0, 0, 0];
+      });
+      break;
+    case 'banner':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        if (x < 3 || x > 12) { ctx.clearRect(x, y, 1, 1); continue; }
+        const band = Math.floor(y / 4) % 2;
+        const n = R(y * 16 + x) * 20;
+        px(ctx, x, y, band ? rgb(214 + n, 60 + n, 132 + n) : rgb(28 + n, 34 + n, 58 + n));
+      }
+      break;
+    case 'litGlass':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const frame = (x === 0 || y === 0 || x === TILE - 1 || y === TILE - 1) || x === 7 || y === 7;
+        if (frame) px(ctx, x, y, rgb(92, 62, 38));
+        else {
+          const d = Math.hypot((x % 8) - 3.5, (y % 8) - 3.5);
+          const v = 1 - d * 0.06;
+          px(ctx, x, y, rgb(255 * v, 214 * v, 132 * v));
+        }
+      }
+      break;
+    case 'awning':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const band = Math.floor(x / 3) % 2;
+        const n = R(y * 16 + x) * 16;
+        px(ctx, x, y, band ? rgb(206 + n, 78 + n, 96 + n) : rgb(240 + n, 232 + n, 214 + n));
+      }
+      break;
+    case 'ice':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const n = R(y * 16 + x);
+        const crack = (Math.abs(((x * 5 + y * 3) % 16) - 8) < 1) ? -26 : 0;
+        px(ctx, x, y, rgb(176 + n * 40 + crack, 222 + n * 26 + crack, 248 + n * 8));
+      }
+      break;
+    case 'magma':
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const v = Math.sin(x * 0.9) * Math.cos(y * 0.7) * 0.5 + 0.5;
+        const n = R(y * 16 + x);
+        const hot = v > 0.55 || n > 0.86;
+        px(ctx, x, y, hot ? rgb(250, 140 + v * 80, 40) : rgb(74 + v * 30, 30 + v * 16, 24));
+      }
+      break;
+    case 'skyGlass':
+      // a near-invisible pane: a one-pixel cool rim and a few sparks of reflection
+      for (let y = 0; y < TILE; y++) for (let x = 0; x < TILE; x++) {
+        const edge = (x === 0 || y === 0 || x === TILE - 1 || y === TILE - 1);
+        if (edge) px(ctx, x, y, 'rgba(178,226,240,0.96)');
+        else if ((x * 7 + y * 3) % 23 === 0) px(ctx, x, y, 'rgba(236,250,255,0.9)');
+        else ctx.clearRect(x, y, 1, 1);
+      }
+      break;
+    case 'neonM': grain([232, 66, 156], [16, 22, 20], (x, y, n) => n > 0.5 ? [20, 30, 26] : [0, 0, 0]); break;
+    case 'neonC': grain([56, 216, 232], [18, 16, 16], (x, y, n) => n > 0.5 ? [24, 24, 20] : [0, 0, 0]); break;
+    default: grain([255, 0, 255], [0, 0, 0]);
+  }
+}
+
+function buildAtlas() {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = ATLAS;
+  const ctx = cv.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  // scratch tile, then stamp a 2x2 repeat into the padded cell so mip
+  // bleeding pulls in the *same* texture instead of a neighbour's.
+  const sc = document.createElement('canvas');
+  sc.width = sc.height = TILE;
+  const sx = sc.getContext('2d');
+
+  const names = Object.keys(T);
+  for (const name of names) {
+    const idx = T[name];
+    sx.clearRect(0, 0, TILE, TILE);
+    drawTile(sx, name, idx + 1);
+    const cx = (idx % COLS) * CELL, cy = ((idx / COLS) | 0) * CELL;
+    ctx.clearRect(cx, cy, CELL, CELL);
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+      ctx.drawImage(sc, cx + PAD + a * TILE, cy + PAD + b * TILE);
+    }
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.LinearMipmapNearestFilter;
+  tex.generateMipmaps = true;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  tex.needsUpdate = true;
+  return { tex, canvas: cv };
+}
+
+function tileUV(idx) {
+  const cx = (idx % COLS) * CELL + PAD, cy = ((idx / COLS) | 0) * CELL + PAD;
+  return { u0: cx / ATLAS, v0: 1 - (cy + TILE) / ATLAS, du: TILE / ATLAS, dv: TILE / ATLAS };
+}
+const UVT = [];
+for (let i = 0; i < COLS * COLS; i++) UVT[i] = tileUV(i);
+
+/* ==================== world ==================== */
+class World {
+  constructor(seed) {
+    this.seed = seed >>> 0;
+    this.n = makeNoise(this.seed);
+    this.chunks = new Map();
+    this.edits = new Map();     // sparse player edits: "x,y,z" -> id
+    this.rave = this.findRave();
+    this.city = buildCity(this);
+    this.portal = this.findPortal();
+    this.aerie = this.findAerie();
+    this.skyIsles = this.findSkyIsles();
+    this.lighthouse = this.findLighthouse();
+  }
+
+  /* THE AERIE: the spawn. A lens of rock floating at the top of the world,
+     capped by a glass-and-timber observation deck, sitting on the elevator's
+     top station so the shaft is the way home. The prow points at the portal.
+     Everything here is a pure function of (x, z) so it streams like terrain. */
+  findAerie() {
+    const R = this.rave; if (!R || !R.elevator) return null;
+    const EL = R.elevator;
+    const cx = R.x + EL.dx, cz = R.z + EL.dz;
+    // well clear of the stadium's cornice (topY + 12) so the ledge reads as
+    // floating, and the shaft climbs to meet it
+    const y = Math.min(MAXY - 10, R.topY + 36);
+    EL.y1 = y;
+    const P = this.portal;
+    const prowA = P ? Math.atan2(P.z - cz, P.x - cx) : Math.atan2(cz - R.z, cx - R.x);
+    const A = {
+      x: cx, z: cz, y, r: 15, prowA, prowLen: 9, name: 'The Aerie',
+      // the pavilion sits opposite the prow; the beacon mast beside it
+      pavA: prowA + Math.PI, beaconA: prowA + Math.PI * 0.62
+    };
+    const sd = 5.5;
+    A.spawn = {
+      x: cx + Math.cos(prowA) * sd + 0.5, z: cz + Math.sin(prowA) * sd + 0.5,
+      yaw: faceYaw(0, 0, Math.cos(prowA), Math.sin(prowA)), pitch: -0.10
+    };
+    A.prowTip = { x: cx + Math.cos(prowA) * (A.r + A.prowLen - 1), z: cz + Math.sin(prowA) * (A.r + A.prowLen - 1) };
+    return A;
+  }
+
+  applyAerie(ch) {
+    const A = this.aerie; if (!A) return;
+    const x0 = ch.cx * CS, z0 = ch.cz * CS, lim = A.r + A.prowLen + 4;
+    if (x0 + CS < A.x - lim || x0 > A.x + lim || z0 + CS < A.z - lim || z0 > A.z + lim) return;
+    const vox = ch.vox;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    const set = (lx, y, lz, id) => { if (y >= 0 && y <= MAXY) vox[idx(lx, y, lz)] = id; };
+    const R = this.rave, EL = R.elevator;
+    const Y = A.y;
+    for (let lz = 0; lz < CS; lz++) {
+      for (let lx = 0; lx < CS; lx++) {
+        const wx = x0 + lx, wz = z0 + lz;
+        const dx = wx - A.x, dz = wz - A.z;
+        const d = Math.hypot(dx, dz);
+        const ang = Math.atan2(dz, dx);
+        const inShaft = Math.abs(dx) <= 2 && Math.abs(dz) <= 2;
+        const shaftWall = Math.abs(dx) <= 3 && Math.abs(dz) <= 3 && !inShaft;
+        const onProwPre = Math.abs(angDist(ang, A.prowA)) < 0.17;
+        // the rim wobbles so it reads as rock, not a cut disc
+        const rr = A.r + this.n.fbm2(wx * 0.11 + 7.1, wz * 0.11 - 3.3, 2) * 2.2;
+
+        // ---- the prow: a timber launch platform reaching out toward the portal ----
+        const pc = Math.cos(A.prowA), ps = Math.sin(A.prowA);
+        const along = dx * pc + dz * ps, across = -dx * ps + dz * pc;
+        if (along > A.r - 3 && along <= A.r + A.prowLen && Math.abs(across) <= 2.2) {
+          const tip = along > A.r + A.prowLen - 1.2;
+          set(lx, Y, lz, tip ? NEON_M : ((Math.round(along) % 4 === 0) ? LOG : PLANK));
+          for (let y = Y + 1; y <= Y + 4; y++) set(lx, y, lz, AIR);
+          // side rails stop short of the tip so the leap is open
+          if (Math.abs(across) > 1.4 && along < A.r + A.prowLen - 3) {
+            set(lx, Y + 1, lz, LOG);
+            if (Math.round(along) % 3 === 0) set(lx, Y + 2, lz, LANT_P);
+          }
+          // bearers under the deck
+          if (Math.round(along) % 3 === 1) set(lx, Y - 1, lz, LOG);
+          if (Math.abs(across) < 0.6 && along < A.r + 2) set(lx, Y - 1, lz, LOG);
+        }
+        if (d > rr) continue;
+
+        // ---- floating rock: a ring of stone under the rim and a collar round
+        // the shaft, open in between so the glass deck looks straight down;
+        // timber spokes and a ring beam carry the panels ----
+        const hasRock = d > rr - 4.5 || d < 5.5;
+        const depth = Math.round((d > rr - 4.5 ? (1 - (d - (rr - 4.5)) / 4.5) * 4.5 + (rr - d) * 0.3 : 4 - d * 0.4) + this.n.fbm2(wx * 0.2, wz * 0.2, 2) * 1.2) + 2;
+        if (hasRock) {
+          for (let k = 1; k <= depth; k++) {
+            const y = Y - k;
+            if (inShaft && y >= EL.y0) continue;            // the shaft passes through
+            const shell = k === depth || d > rr - 1.5;
+            set(lx, y, lz, k <= 2 ? (shell ? BASALT : STONE) : (shell ? STONE : BASALT));
+          }
+          // glowing ice crystals hanging from the underside, lanterns at the rim
+          const h1 = rnd2(wx, wz, 5151);
+          if (h1 < 0.07 && d > 3) {
+            const len = 1 + ((rnd2(wx, wz, 5152) * 3) | 0);
+            for (let k = 1; k <= len; k++) set(lx, Y - depth - k, lz, ICE);
+          } else if (h1 < 0.18 && d > rr - 3) {
+            const len = 2 + ((rnd2(wx, wz, 5153) * 4) | 0);
+            for (let k = 1; k <= len; k++) set(lx, Y - depth - k, lz, LEAF);
+          }
+          if (d > rr - 1.2 && ((wx * 3 + wz * 5) % 9) === 0) set(lx, Y - depth - 1, lz, LANT_P);
+        } else {
+          // spokes from the shaft collar to the rim ring, plus one ring beam
+          let onSpoke = false;
+          for (let k = 0; k < 8; k++) {
+            const sa = k * Math.PI / 4;
+            const along = dx * Math.cos(sa) + dz * Math.sin(sa);
+            const off = Math.abs(-dx * Math.sin(sa) + dz * Math.cos(sa));
+            if (along > 0 && off < 0.55) { onSpoke = true; break; }
+          }
+          if (onSpoke || Math.abs(d - 10) < 0.55) set(lx, Y - 1, lz, LOG);
+          for (let y = Y - 2; y >= Y - 8; y--) if (vox[idx(lx, y, lz)] !== AIR && !(inShaft)) set(lx, y, lz, AIR);
+        }
+
+        // ---- the deck ----
+        for (let y = Y + 1; y <= Y + 9; y++) if (!inShaft || y > Y) set(lx, y, lz, AIR);
+        if (inShaft) { set(lx, Y, lz, AIR); }
+        else if (shaftWall) { set(lx, Y, lz, SANDSTONE); }
+        else if (d > rr - 1.4) { set(lx, Y, lz, SANDSTONE); }                  // stone kerb
+        else if (d > rr - 2.4) { set(lx, Y, lz, ((wx + wz) & 1) ? NEON_C : SANDSTONE); }   // lit inlay ring
+        else {
+          // glass panels framed in timber, so you look straight down at the world
+          const px = ((dx + 100) % 5), pz = ((dz + 100) % 5);
+          const frame = px === 0 || pz === 0;
+          set(lx, Y, lz, frame ? PLANK : SKYGLASS);
+        }
+        // planters along the kerb
+        if (d > rr - 1.4 && d <= rr - 0.4 && !onProwPre && ((wx * 5 + wz * 3) % 7) === 0) set(lx, Y + 1, lz, LEAF);
+        // ---- railing: posts, rope, paper lanterns; open where the prow leaves ----
+        const onProw = Math.abs(angDist(ang, A.prowA)) < 0.17;
+        if (d > rr - 1.4 && !onProw) {
+          const seg = Math.round(((ang + Math.PI) / TAU) * 40);
+          if (seg % 2 === 0) { set(lx, Y + 1, lz, LOG); set(lx, Y + 2, lz, LOG); if (seg % 8 === 0) set(lx, Y + 3, lz, LANT_P); }
+          else set(lx, Y + 2, lz, ROPE);
+        }
+        // ---- elevator headhouse: four posts and a shingled canopy over the shaft ----
+        if (Math.abs(dx) === 3 && Math.abs(dz) === 3) for (let y = Y + 1; y <= Y + 5; y++) set(lx, y, lz, LOG);
+        if (Math.abs(dx) <= 4 && Math.abs(dz) <= 4) {
+          set(lx, Y + 6, lz, (Math.abs(dx) === 4 || Math.abs(dz) === 4) ? LOG : SHINGLE);
+          if (Math.abs(dx) <= 3 && Math.abs(dz) <= 3 && Math.max(Math.abs(dx), Math.abs(dz)) === 3 && (dx + dz) % 2 === 0) set(lx, Y + 5, lz, LANT_P);
+        }
+        if (Math.abs(dx) === 3 && dz === -3) set(lx, Y + 1, lz, NEON_C);      // door light
+
+        // ---- the pavilion: a glass shelter opposite the prow ----
+        {
+          const pvx = A.x + Math.cos(A.pavA) * (A.r - 6), pvz = A.z + Math.sin(A.pavA) * (A.r - 6);
+          const ax = Math.round(wx - pvx), az = Math.round(wz - pvz);
+          if (Math.abs(ax) <= 3 && Math.abs(az) <= 3) {
+            const wall = Math.abs(ax) === 3 || Math.abs(az) === 3;
+            const corner = Math.abs(ax) === 3 && Math.abs(az) === 3;
+            // the doorway faces the shaft
+            const toShaft = Math.atan2(A.z - pvz, A.x - pvx);
+            const doorX = Math.round(Math.cos(toShaft)) * 3, doorZ = Math.round(Math.sin(toShaft)) * 3;
+            const onDoor = (ax === doorX && Math.abs(az) <= 1 && doorX !== 0) || (az === doorZ && Math.abs(ax) <= 1 && doorZ !== 0);
+            set(lx, Y, lz, wall ? PLANK : ((ax + az) & 1 ? PLANK : SANDSTONE));
+            for (let c = 1; c <= 4; c++) {
+              if (!wall) { set(lx, Y + c, lz, AIR); continue; }
+              if (onDoor && c <= 2) { set(lx, Y + c, lz, AIR); continue; }
+              set(lx, Y + c, lz, corner ? LOG : (c === 4 ? LOG : (c === 1 ? PLANK : LITGLASS)));
+            }
+            set(lx, Y + 5, lz, corner ? LOG : THATCH);
+            if (Math.abs(ax) <= 1 && Math.abs(az) <= 1) set(lx, Y + 6, lz, THATCH);
+            if (ax === 0 && az === 0) { set(lx, Y + 4, lz, LANTERN); set(lx, Y + 7, lz, LANT_P); }
+          }
+        }
+        // ---- beacon mast ----
+        {
+          const bx = Math.round(A.x + Math.cos(A.beaconA) * (A.r - 3)), bz = Math.round(A.z + Math.sin(A.beaconA) * (A.r - 3));
+          if (wx === bx && wz === bz) {
+            for (let y = Y + 1; y <= Y + 10; y++) set(lx, y, lz, (y - Y) % 4 === 0 ? SANDSTONE : LOG);
+            set(lx, Y + 11, lz, NEON_C);
+          }
+          if (Math.abs(wx - bx) + Math.abs(wz - bz) === 1) { set(lx, Y + 1, lz, SANDSTONE); set(lx, Y + 9, lz, LANT_P); }
+        }
+      }
+    }
+  }
+
+  /* THE LIGHTHOUSE: the most exposed reef crest on the seaward side of the
+     island, far from the crater, so its beam reads across the lagoon at night. */
+  findLighthouse() {
+    const R = this.rave; if (!R) return null;
+    let best = null;
+    for (let r = 90; r <= 420; r += 8) {
+      for (let a = 0; a < 36; a++) {
+        const ang = a * TAU / 36 + r * 0.011;
+        const x = Math.round(R.x + Math.cos(ang) * r), z = Math.round(R.z + Math.sin(ang) * r);
+        const c = this.column(x, z);
+        if (c.band > 0.55 && c.h > SEA - 3.5 && c.h < SEA + 1.5) {
+          const score = c.band * 2 + r * 0.004;
+          if (!best || score > best.score) best = { x, z, h: c.h, score, r };
+        }
+      }
+    }
+    if (!best) return null;
+    return { x: best.x, z: best.z, base: SEA + 1, top: SEA + 19, name: 'Reef Light' };
+  }
+
+  applyLighthouse(ch) {
+    const L = this.lighthouse; if (!L) return;
+    const x0 = ch.cx * CS, z0 = ch.cz * CS, pad = 10;
+    if (x0 + CS < L.x - pad || x0 > L.x + pad || z0 + CS < L.z - pad || z0 > L.z + pad) return;
+    const vox = ch.vox;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    const set = (lx, y, lz, id) => { if (y >= 0 && y <= MAXY) vox[idx(lx, y, lz)] = id; };
+    for (let lz = 0; lz < CS; lz++) for (let lx = 0; lx < CS; lx++) {
+      const wx = x0 + lx, wz = z0 + lz;
+      const dx = wx - L.x, dz = wz - L.z, d = Math.hypot(dx, dz);
+      if (d > 7.5) continue;
+      // rock base rising out of the reef, with a stone apron
+      if (d <= 6.5) {
+        const top = d <= 4.5 ? L.base : L.base - 1;
+        for (let y = Math.max(1, SEA - 12); y <= top; y++) if (vox[idx(lx, y, lz)] !== BEDROCK) set(lx, y, lz, y === top ? (d <= 4.5 ? SANDSTONE : BASALT) : BASALT);
+        for (let y = top + 1; y <= L.top + 6; y++) set(lx, y, lz, AIR);
+        if (Math.abs(d - 4.5) < 0.6 && ((wx + wz) & 1)) set(lx, L.base + 1, lz, LOG);   // apron rail
+      }
+      // the tower: banded, tapering slightly
+      if (d <= 2.6) {
+        for (let y = L.base + 1; y <= L.top - 4; y++) {
+          const band = Math.floor((y - L.base) / 3) % 2;
+          set(lx, y, lz, (d > 1.6) ? (band ? BASALT : SANDSTONE) : AIR);
+        }
+        // spiral stair inside
+        const frac = (((Math.atan2(dz, dx)) / TAU) % 1 + 1) % 1;
+        for (let y = L.base + 1 + frac * 6; y <= L.top - 4; y += 6) { const yy = Math.round(y); if (d <= 1.6 && d > 0.6) set(lx, yy, lz, PLANK); }
+        // gallery, lantern room, dome
+        if (d <= 2.6) set(lx, L.top - 3, lz, PLANK);
+        if (d <= 2.9 && d > 2.0) { set(lx, L.top - 3, lz, PLANK); set(lx, L.top - 2, lz, LOG); }
+        if (d <= 2.0) {
+          for (let y = L.top - 2; y <= L.top; y++) set(lx, y, lz, (d > 1.2) ? LITGLASS : (y === L.top - 1 ? LANTERN : AIR));
+          set(lx, L.top + 1, lz, d > 1.2 ? SANDSTONE : BASALT);
+        }
+        if (d <= 1.2) set(lx, L.top + 2, lz, BASALT);
+        if (d < 0.6) { set(lx, L.top + 3, lz, LOG); set(lx, L.top + 4, lz, NEON_M); }
+      }
+      // keeper's hut on the apron
+      const hx = dx - 4, hz = dz;
+      if (Math.abs(hx) <= 1 && Math.abs(hz) <= 1) {
+        const wall = Math.abs(hx) === 1 || Math.abs(hz) === 1;
+        set(lx, L.base + 1, lz, PLANK);
+        for (let c = 2; c <= 3; c++) set(lx, L.base + c, lz, wall ? ((c === 3 && hz === 0) ? LITGLASS : PLANK) : AIR);
+        set(lx, L.base + 4, lz, THATCH);
+        if (hx === 0 && hz === 0) set(lx, L.base + 5, lz, THATCH);
+      }
+    }
+  }
+
+  /* THE SECRET RAVE, a crater amphitheatre cut into the highest volcanic
+     summit. Deterministic from the seed, so it is in the same place every
+     time you load a given world, and generated as terrain rather than as
+     player edits so it costs nothing to stream. */
+  findRave() {
+    let best = null;
+    for (let r = 140; r <= 760; r += 20) {
+      for (let a = 0; a < 28; a++) {
+        const ang = a * Math.PI / 14 + r * 0.013;
+        const x = Math.round(Math.cos(ang) * r), z = Math.round(Math.sin(ang) * r);
+        const c = this.column(x, z);
+        if (c.h > SEA + 15 && (!best || c.h > best.h)) best = { x, z, h: c.h };
+      }
+    }
+    if (!best) best = { x: 220, z: -180, h: SEA + 22 };
+    const floorY = Math.max(SEA + 4, Math.round(best.h) - 8);
+    const R = {
+      x: best.x, z: best.z, floorY,
+      inner: 36, rad: 48,                       // sized so the galleon fits amidships
+      vaultY: 0, vipY: 0, skyY: 0,              // filled in below
+      stageZ0: -34, stageZ1: -24, stageX: 15,
+      deckZ: -29, stageTop: floorY + 3,
+      name: 'The Secret Rave'
+    };
+    R.vaultY = R.floorY - 14;
+    R.vipY = R.floorY + 12;
+    R.skyY = R.floorY + 24;
+    /* Seven themed districts stacked around the crater, each with its own DJ,
+       mini stage, palette and crowd. Ring tiers are annuli open to the arena so
+       every level can see the mainstage, and each other. */
+    R.tiers = [
+      { key: 'core',   name: 'Deep Core',       y: R.floorY - 27, kind: 'room',
+        mat: OBSIDIAN, alt: BASALT,  accent: NEON_C, glow: NEON_C, djA: 0.0 },
+      { key: 'nether', name: 'Nether District', y: R.floorY - 14, kind: 'room',
+        mat: BASALT,   alt: MAGMA,   accent: MAGMA,  glow: MAGMA,  djA: Math.PI },
+      { key: 'main',   name: 'Mainstage',       y: R.floorY,      kind: 'floor',
+        mat: OBSIDIAN, alt: BASALT,  accent: NEON_M, glow: NEON_M, djA: null },
+      { key: 'water',  name: 'Water Walk',      y: R.floorY + 11, kind: 'ring',
+        mat: GLASS,    alt: ICE,     accent: NEON_C, glow: NEON_C, djA: 0.9 },
+      { key: 'jungle', name: 'Jungle Terrace',  y: R.floorY + 22, kind: 'ring',
+        mat: PLANK,    alt: LEAF,    accent: LANT_P, glow: LANT_P, djA: 2.6 },
+      { key: 'frost',  name: 'Frost Ridge VIP', y: R.floorY + 33, kind: 'ring',
+        mat: ICE,      alt: GLASS,   accent: NEON_C, glow: ICE,    djA: 4.1 },
+      { key: 'end',    name: 'End Zone',        y: R.floorY + 44, kind: 'ring',
+        mat: OBSIDIAN, alt: NEON_M,  accent: NEON_M, glow: NEON_M, djA: 5.5 },
+      { key: 'cloud',  name: 'Cloud Deck',      y: R.floorY + 55, kind: 'ring',
+        mat: ICE,      alt: PLANK,   accent: LANT_P, glow: LANT_P, djA: 1.7 },
+      { key: 'aurora', name: 'Aurora Deck',     y: R.floorY + 66, kind: 'ring',
+        mat: GLASS,    alt: NEON_C,  accent: NEON_M, glow: NEON_C, djA: 3.4 },
+      { key: 'abyss',  name: 'The Abyss',       y: R.floorY - 40, kind: 'room',
+        mat: BASALT,   alt: OBSIDIAN, accent: NEON_M, glow: NEON_M, djA: 2.2 }
+    ];
+    /* Ten more decks. Generated rather than hand-written so the stack stays
+       consistent as it grows: rings above, rooms below, each with its own DJ
+       bearing spread around the bowl. */
+    const EXTRA = [
+      ['bazaar', 'Neon Bazaar',    75, 'ring', PLANK,    AWNING,  NEON_M, LANT_P],
+      ['coral',  'Coral Deck',     84, 'ring', SANDSTONE, COR_P,  COR_T,  LANT_P],
+      ['storm',  'Storm Deck',     93, 'ring', BASALT,   GLASS,   NEON_C, NEON_C],
+      ['gilded', 'Gilded Tier',   102, 'ring', SHINGLE,  LOG,     LANT_P, LANT_P],
+      ['void',   'Void Balcony',  111, 'ring', OBSIDIAN, NEON_M,  NEON_M, NEON_M],
+      ['prism',  'Prism Deck',    120, 'ring', GLASS,    ICE,     NEON_C, NEON_C],
+      ['solar',  'Solar Deck',    129, 'ring', MAGMA,    BASALT,  MAGMA,  MAGMA],
+      ['halo',   'Halo Deck',     138, 'ring', ICE,      GLASS,   LANT_P, ICE],
+      ['zenith', 'Zenith Deck',   147, 'ring', GLASS,    NEON_C,  NEON_M, NEON_C],
+      ['forge',  'Magma Vault',   -53, 'room', BASALT,   MAGMA,   MAGMA,  MAGMA]
+    ];
+    EXTRA.forEach((e, k) => {
+      const y = R.floorY + e[2];
+      if (y < 2 || y + 12 > MAXY) return;            // never carve into bedrock or the sky cap
+      // rooms are 12 blocks tall; two closer than that and one's ceiling eats
+      // the other's floor. Rings are thin and may sit closer.
+      const clash = R.tiers.some((T) =>
+        (T.kind === 'room' || e[3] === 'room') && Math.abs(T.y - y) < 13);
+      if (clash) return;
+      R.tiers.push({
+        key: e[0], name: e[1], y, kind: e[3],
+        mat: e[4], alt: e[5], accent: e[6], glow: e[7],
+        djA: (k * 0.83 + 0.35) % TAU
+      });
+    });
+    R.topY = Math.max(...R.tiers.map((t) => t.y));
+    /* Per-height mask for the stadium shell. Without this the facade re-scans
+       all twenty tiers for every one of ~180 wall blocks per column, which cost
+       more than the rest of the venue put together. */
+    // the shaft climbs the wall on the far side from the stage
+    {
+      const ea = Math.PI * 0.5;
+      const er = R.rad + 3;
+      R.elevator = {
+        dx: Math.round(Math.cos(ea) * er), dz: Math.round(Math.sin(ea) * er),
+        y0: R.floorY + 1, y1: Math.min(MAXY - 12, R.topY + 14)
+      };
+    }
+    R.yMask = new Uint8Array(WH);
+    for (const T of R.tiers) {
+      if (T.kind !== 'ring') continue;
+      if (T.y >= 0 && T.y < WH) R.yMask[T.y] |= 1;                    // deck level
+      for (let k = 3; k <= 7; k++) if (T.y + k < WH) R.yMask[T.y + k] |= 2;  // window band
+      if (T.y - 1 >= 0) R.yMask[T.y - 1] |= 4;                        // string course
+      if (T.y + 9 < WH) R.yMask[T.y + 9] |= 4;
+      if (T.y - 1 >= 0) R.yMask[T.y - 1] |= 8;                        // soffit
+      if (T.y - 2 >= 0) R.yMask[T.y - 2] |= 16;                       // edge beam
+      if (T.y - 3 >= 0) R.yMask[T.y - 3] |= 32;                       // corbel
+    }
+
+    /* THE GALLEON, a wrecked ship run aground in the middle of the dancefloor,
+       overgrown with jungle, its decks and rigging used as dance platforms. */
+    R.ship = {
+      x: R.x, z: R.z + 8, keel: R.floorY + 1,
+      L: 21, B: 8,                                  // half-length, half-beam
+      // clearances (verified): 11 blocks stage-front to stern, 7 bow to rim
+      deck: R.floorY + 8, qdeck: R.floorY + 12, fdeck: R.floorY + 11,
+      mastTop: R.floorY + 34
+    };
+    return R;
+  }
+
+  /* THE SEAFLOOR PORTAL, a large pink gate on the lagoon bed, deterministic
+     from the seed, placed a real swim from the city so the descent is a journey.
+     Generated as terrain like everything else. */
+  findPortal() {
+    const C = this.city;
+    const ox = C ? C.cx : 0, oz = C ? C.cz : 0;
+    let best = null;
+    for (let r = 60; r <= 340; r += 6) {
+      for (let a = 0; a < 24; a++) {
+        const ang = a * Math.PI / 12 + r * 0.017;
+        const x = Math.round(ox + Math.cos(ang) * r), z = Math.round(oz + Math.sin(ang) * r);
+        const h = this.column(x, z).h;
+        const depth = SEA - h;
+        if (depth >= 6 && depth <= 16) {
+          const score = -Math.abs(depth - 11) - r * 0.004;
+          if (!best || score > best.score) best = { x, z, floor: Math.floor(h), depth, score };
+        }
+      }
+      if (best && r > 150) break;
+    }
+    if (!best) return null;
+    return { x: best.x, z: best.z, floor: best.floor, depth: best.depth, w: 5, h: 7 };
+  }
+
+  /* FLOATING SKY ISLANDS, chunks of jungle hanging over the crater, each
+     trailing vines and lit from below, the way the whole scene reads from the
+     dancefloor when you look up. */
+  findSkyIsles() {
+    const R = this.rave; if (!R) return [];
+    const out = [];
+    const N = 9;
+    const A = this.aerie;
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * TAU + rnd2(i, 3, 6611) * 0.7;
+      const rad = 12 + rnd2(i, 5, 6612) * (R.rad + 26);
+      const x = Math.round(R.x + Math.cos(a) * rad), z = Math.round(R.z + Math.sin(a) * rad);
+      // keep the Aerie's airspace clear: nothing within 34 blocks of its centre
+      if (A && Math.hypot(x - A.x, z - A.z) < 34) continue;
+      out.push({
+        x, z,
+        y: Math.min(MAXY - 12, R.topY + 12 + Math.round(rnd2(i, 7, 6613) * 30)),
+        r: 5 + rnd2(i, 9, 6614) * 6,
+        tree: rnd2(i, 11, 6615) > 0.35,
+        lit: rnd2(i, 13, 6616) > 0.4, i
+      });
+    }
+    return out;
+  }
+
+  applySkyIsles(ch) {
+    const IS = this.skyIsles; if (!IS || !IS.length) return;
+    const x0 = ch.cx * CS, z0 = ch.cz * CS;
+    const vox = ch.vox;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    const set = (wx, wy, wz, id, hard) => {
+      const lx = wx - x0, lz = wz - z0;
+      if (lx < 0 || lz < 0 || lx >= CS || lz >= CS || wy < 0 || wy > MAXY) return;
+      const cur = vox[idx(lx, wy, lz)];
+      if (!hard && cur !== AIR) return;
+      vox[idx(lx, wy, lz)] = id;
+    };
+    for (const S2 of IS) {
+      if (x0 + CS < S2.x - S2.r - 8 || x0 > S2.x + S2.r + 8) continue;
+      if (z0 + CS < S2.z - S2.r - 8 || z0 > S2.z + S2.r + 8) continue;
+      for (let lz = 0; lz < CS; lz++) {
+        for (let lx = 0; lx < CS; lx++) {
+          const wx = x0 + lx, wz = z0 + lz;
+          const dx = wx - S2.x, dz = wz - S2.z;
+          const d = Math.hypot(dx, dz);
+          if (d > S2.r + 3) continue;
+          const n = this.n.fbm2(wx * 0.09, wz * 0.09, 2) * 1.6;
+          const rr = S2.r + n;
+          if (d <= rr) {
+            // a lens of rock: flat top, tapering underside
+            const depth = Math.round((1 - d / Math.max(0.001, rr)) * 5) + 1;
+            set(wx, S2.y, wz, GRASS, true);
+            for (let k = 1; k <= depth; k++) set(wx, S2.y - k, wz, k > 2 ? STONE : DIRT, true);
+            // vines trailing off the underside
+            if (d > rr - 1.2 && rnd2(wx, wz, 4242) < 0.22) {
+              const len = 2 + ((rnd2(wx, wz, 4243) * 4) | 0);
+              for (let k = 1; k <= len; k++) set(wx, S2.y - depth - k, wz, LEAF, false);
+            }
+            if (S2.lit && ((wx * 3 + wz * 5) % 11 === 0)) set(wx, S2.y - depth - 1, wz, LANT_P, false);
+          }
+          // a palm-ish tree on top
+          if (S2.tree && Math.abs(dx) <= 3 && Math.abs(dz) <= 3) {
+            if (dx === 0 && dz === 0) {
+              for (let k = 1; k <= 6; k++) set(wx, S2.y + k, wz, LOG, true);
+            }
+            const cd = Math.hypot(dx, dz);
+            if (cd <= 3.2) {
+              const cy = S2.y + 7 - Math.round(cd * 0.7);
+              if (cd > 0.4) set(wx, cy, wz, LEAF, false);
+              if (cd <= 2) set(wx, cy + 1, wz, LEAF, false);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  applyPortal(ch) {
+    const P = this.portal; if (!P) return;
+    const x0 = ch.cx * CS, z0 = ch.cz * CS, pad = 16;
+    if (x0 + CS < P.x - pad || x0 > P.x + pad || z0 + CS < P.z - pad || z0 > P.z + pad) return;
+    const vox = ch.vox;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    const set = (wx, wy, wz, id, hard) => {
+      const lx = wx - ch.cx * CS, lz = wz - ch.cz * CS;
+      if (lx < 0 || lz < 0 || lx >= CS || lz >= CS || wy < 0 || wy > MAXY) return;
+      const cur = vox[idx(lx, wy, lz)];
+      if (!hard && cur !== AIR && cur !== WATER) return;
+      vox[idx(lx, wy, lz)] = id;
+    };
+    const hw = (P.w - 1) / 2;
+    const baseY = P.floor + 1;
+
+    for (let dx = -9; dx <= 9; dx++) for (let dz = -9; dz <= 9; dz++) {
+      const d = Math.hypot(dx, dz);
+      if (d > 9) continue;
+      const ring = Math.abs(d - 6.5) < 0.9;
+      set(P.x + dx, P.floor, P.z + dz, ring ? NEON_M : OBSIDIAN, true);
+      for (let y = 1; y <= 2; y++) set(P.x + dx, P.floor + y, P.z + dz, WATER, false);
+    }
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+      for (let y = 0; y < 5; y++) set(P.x + sx * 7, baseY + y, P.z + sz * 7, y === 4 ? NEON_M : OBSIDIAN, true);
+    }
+    for (let dx = -hw - 1; dx <= hw + 1; dx++) {
+      for (let y = 0; y <= P.h + 1; y++) {
+        const edge = Math.abs(dx) > hw || y === 0 || y > P.h;
+        if (!edge) continue;
+        const corner = Math.abs(dx) > hw && (y === 0 || y > P.h);
+        set(P.x + dx, baseY + y, P.z, corner ? NEON_M : OBSIDIAN, true);
+      }
+    }
+    for (let dx = -hw; dx <= hw; dx++)
+      for (let y = 1; y <= P.h; y++)
+        set(P.x + dx, baseY + y, P.z, PORTAL, true);
+    for (const dz of [-1, 1]) for (const dx of [-hw - 1, hw + 1]) {
+      for (let y = 0; y <= P.h + 1; y += 2) set(P.x + dx, baseY + y, P.z + dz, OBSIDIAN, true);
+    }
+  }
+
+  applyRave(ch) {
+    const R = this.rave; if (!R) return;
+    const x0 = ch.cx * CS, z0 = ch.cz * CS, lim = R.rad + 18;
+    if (x0 + CS < R.x - lim || x0 > R.x + lim || z0 + CS < R.z - lim || z0 > R.z + lim) return;
+    const vox = ch.vox;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    const set = (lx, y, lz, id) => { if (y >= 0 && y <= MAXY) vox[idx(lx, y, lz)] = id; };
+
+    /* The shaft stands OUTSIDE the bowl (rad + 3), so it is carved for every
+       column in range, not only the ones inside the crater. */
+    const elevatorColumn = (lx, lz, dx, dz) => {
+      /* ================= ELEVATOR TO SPACE =================================
+         A lattice shaft climbing the stadium wall from the dancefloor to the
+         top of the world, with a landing at every ring deck. The car itself
+         is a moving platform handled in the frame loop. */
+      {
+        const EL = R.elevator;
+        const ex = dx - EL.dx, ez = dz - EL.dz;
+        if (Math.abs(ex) <= 4 && Math.abs(ez) <= 4) {
+          const corner = Math.abs(ex) === 3 && Math.abs(ez) === 3;
+          const wall = (Math.abs(ex) === 3 || Math.abs(ez) === 3) &&
+                       Math.abs(ex) <= 3 && Math.abs(ez) <= 3;
+          const inside = Math.abs(ex) <= 2 && Math.abs(ez) <= 2;
+          for (let y = EL.y0 - 1; y <= EL.y1; y++) {
+            if (inside) { set(lx, y, lz, AIR); continue; }
+            if (corner) {
+              set(lx, y, lz, ((y >> 2) & 1) ? SANDSTONE : BASALT);   // the four legs
+            } else if (wall) {
+              // open lattice: glazed bands with structural ties
+              const tie = (y % 6 === 0);
+              const front = (ez === -3);                              // door side faces the bowl
+              if (tie) set(lx, y, lz, LOG);
+              else if (front) set(lx, y, lz, AIR);
+              else set(lx, y, lz, ((y >> 1) & 1) ? LITGLASS : AIR);
+            }
+          }
+          // base station
+          if (Math.abs(ex) <= 3 && Math.abs(ez) <= 3) {
+            set(lx, EL.y0 - 1, lz, SANDSTONE);
+            if (corner) set(lx, EL.y0 + 20, lz, LANT_P);
+          }
+          // a landing at every ring deck so you can step off
+          const YM = R.yMask;
+          for (let y = EL.y0; y <= EL.y1; y++) {
+            if (!(YM[y] & 1)) continue;
+            if (Math.abs(ex) <= 2 && ez >= -4 && ez <= -3) set(lx, y, lz, PLANK);
+            if (Math.abs(ex) === 3 && ez === -3) set(lx, y, lz, NEON_C);  // door light
+          }
+          // beacon mast at the very top (the Aerie replaces it with its headhouse)
+          if (ex === 0 && ez === 0 && !this.aerie) {
+            for (let y = EL.y1 + 1; y <= EL.y1 + 8; y++) set(lx, y, lz, LOG);
+            set(lx, EL.y1 + 9, lz, NEON_M);
+          }
+        }
+      }
+
+    };
+
+    for (let lz = 0; lz < CS; lz++) {
+      for (let lx = 0; lx < CS; lx++) {
+        const wx = x0 + lx, wz = z0 + lz;
+        const dx = wx - R.x, dz = wz - R.z;
+        const d = Math.hypot(dx, dz);
+
+        // ---- approach tunnel through the crater wall ----
+        if (d > R.inner - 2 && d < R.rad + 15 && Math.abs(dx) <= 1 && dz > 0) {
+          for (let y = R.floorY + 1; y <= R.floorY + 3; y++) set(lx, y, lz, AIR);
+          set(lx, R.floorY, lz, BASALT);
+          if (dx === 0 && wz % 6 === 0) set(lx, R.floorY + 3, lz, LANTERN);
+        }
+        if (d > R.rad) { elevatorColumn(lx, lz, dx, dz); continue; }
+
+        // ---- bowl profile: flat floor, then stepped terraces to the rim ----
+        const tier = d <= R.inner ? 0 : Math.floor((d - R.inner) / 2.6) + 1;
+        const surf = R.floorY + tier * 2;
+        const onStage = dz >= R.stageZ0 && dz <= R.stageZ1 && Math.abs(dx) <= R.stageX;
+
+        // carve the bowl open to the sky
+        for (let y = surf + 1; y <= Math.min(MAXY, R.floorY + 26); y++) set(lx, y, lz, AIR);
+        // make sure nothing is floating under the new surface
+        for (let y = Math.max(1, surf - 3); y <= surf; y++) {
+          if (vox[idx(lx, y, lz)] === AIR || vox[idx(lx, y, lz)] === WATER) set(lx, y, lz, BASALT);
+        }
+
+        if (tier === 0) {
+          // dance floor: obsidian / basalt check with neon inlay strips
+          const neon = (wx % 8 === 0) || (wz % 8 === 0);
+          const chk = (((wx >> 1) + (wz >> 1)) & 1) === 0;
+          set(lx, surf, lz, neon ? (((wx + wz) & 2) ? NEON_M : NEON_C) : (chk ? OBSIDIAN : BASALT));
+        } else {
+          set(lx, surf, lz, BASALT);
+          const edge = Math.abs(d - (R.inner + (tier - 1) * 2.6)) < 0.75;
+          if (edge && ((wx + wz) & 3) === 0) set(lx, surf, lz, NEON_C);
+          if (d > R.rad - 1.6 && ((wx * 3 + wz) % 7 === 0)) set(lx, surf + 1, lz, LANTERN);
+        }
+
+        // ================= THEMED DISTRICTS ====================================
+        const inRingBand = d > R.rad - 8 && d <= R.rad - 1;
+        const inRoomBand = d <= R.inner - 1;
+        for (let ti = 0; ti < R.tiers.length; ti++) {
+          const TR = R.tiers[ti];
+          if (TR.kind === 'floor') continue;
+          // skip whole districts for columns that cannot touch them
+          if (TR.kind === 'ring' && !inRingBand && !(TR.djA !== null && d > R.rad - 12)) continue;
+          if (TR.kind === 'room' && !inRoomBand && !(TR.djA !== null && d < R.inner + 2)) continue;                 // the mainstage is built above
+
+          if (TR.kind === 'room') {
+            // a sealed room: hollow it out, floor it, ceil it, carry it on pillars
+            if (d > R.inner - 1) continue;
+            const ceil = TR.y + 11;
+            for (let y = TR.y + 1; y <= ceil - 1; y++) set(lx, y, lz, AIR);
+            const chk = ((wx >> 2) + (wz >> 2)) & 1;
+            set(lx, TR.y, lz, chk ? TR.mat : TR.alt);
+            if ((wx % 12 === 0) || (wz % 12 === 0)) set(lx, TR.y, lz, TR.accent);
+            set(lx, ceil, lz, BASALT);
+            if ((wx % 5 === 0) && (wz % 5 === 0)) set(lx, ceil - 1, lz, TR.glow);
+            // pillars on two rings
+            if ((Math.abs(d - 10) < 1.0 || Math.abs(d - 21) < 1.0 || Math.abs(d - 31) < 1.0) && ((wx + wz) % 7 === 0)) {
+              for (let y = TR.y + 1; y <= ceil - 1; y++) set(lx, y, lz, BASALT);
+            }
+            // the glowing core column
+            if (d < 2.4) for (let y = TR.y + 1; y <= ceil - 1; y++) set(lx, y, lz, (y % 3) ? TR.accent : TR.glow);
+            // molten channels in the nether district
+            if (TR.key === 'nether' && Math.abs(d - 12) < 0.9 && ((wx * 3 + wz) % 5 === 0)) set(lx, TR.y, lz, MAGMA);
+          } else {
+            // a ring balcony: open to the arena, railed on the outside only
+            const inner = R.rad - 8, outer = R.rad - 1;
+            // admit the 6 blocks inward of the deck: that is where the
+            // cantilevered boxes hang out over the arena
+            if (d <= inner - 6 || d > outer) continue;
+            for (let y = TR.y + 1; y <= TR.y + 8; y++) set(lx, y, lz, AIR);
+            if (d <= inner) {
+              // cantilever zone: private boxes only, no deck surface
+              const angC = Math.atan2(dz, dx);
+              const bayC = ((angC + Math.PI) / TAU) * 16;
+              const phaseC = Math.abs((bayC % 1) - 0.5) * 2;
+              if (phaseC > 0.55 && ((Math.round(bayC) & 1) === 0)) {
+                set(lx, TR.y, lz, PLANK);
+                // the balustrade sits on the box's leading edge, the old
+                // threshold was inward of where the cantilever actually reaches
+                if (d < inner - 2.4) {
+                  set(lx, TR.y + 1, lz, LOG);
+                  if (d < inner - 3.4) set(lx, TR.y + 2, lz, TR.glow);
+                }
+                if (phaseC > 0.80) {
+                  set(lx, TR.y + 5, lz, TR.alt);
+                  set(lx, TR.y + 6, lz, SHINGLE);
+                }
+                const drop = Math.round((inner - d) * 0.8);
+                if (drop >= 1 && drop <= 4) set(lx, TR.y - drop, lz, LOG);
+              }
+              continue;
+            }
+            // Coarse 4-block panels, not a per-block checker: at deck distance a
+            // 1-block alternation aliases into pink/cyan confetti and the
+            // architecture stops reading as floors at all.
+            const chk = ((wx >> 2) + (wz >> 2)) & 1;
+            set(lx, TR.y, lz, chk ? TR.mat : TR.alt);
+            // one continuous accent band per deck instead of scattered specks
+            if (Math.abs(d - (inner + 3)) < 0.9) set(lx, TR.y, lz, TR.accent);
+            if (d > outer - 1.2) {                            // outer rail
+              set(lx, TR.y + 1, lz, LOG);
+              if (((wx * 3 + wz * 7) % 15) === 0) set(lx, TR.y + 2, lz, TR.glow);
+            }
+            if (((wx * 5 + wz * 3) % 29) === 0) set(lx, TR.y + 5, lz, TR.glow);
+
+            /* ---- inner-ring architecture --------------------------------
+               Large forms only. At stadium distance anything finer than a
+               couple of blocks aliases into noise, so the complexity here is
+               structural: a colonnade, cantilevered boxes, arched vomitories
+               and stair flights, all sized to read as silhouette. */
+            const ang = Math.atan2(dz, dx);
+            const seg = (ang + Math.PI) / TAU;             // 0..1 around the ring
+            const BAYS = 16;
+            const bay = seg * BAYS;
+            const bayPhase = Math.abs((bay % 1) - 0.5) * 2;  // 1 at bay centre
+
+            // 1. COLONNADE, columns under the deck, arches springing between
+            if (bayPhase > 0.80 && d > inner + 1 && d < outer - 1.5) {
+              for (let y = TR.y - 9; y <= TR.y - 1; y++) set(lx, y, lz, TR.mat);
+              set(lx, TR.y - 10, lz, TR.accent);            // capital
+              if (((ti + Math.round(bay)) & 1) === 0) set(lx, TR.y - 5, lz, TR.glow);
+            } else if (bayPhase > 0.62 && d > inner + 1 && d < outer - 1.5) {
+              // the arch haunch: two blocks that turn columns into arcades
+              const rise = Math.round((bayPhase - 0.62) * 6);
+              set(lx, TR.y - 1 - rise, lz, TR.mat);
+            }
+
+            // 3. VOMITORY, an arched tunnel mouth through the rear wall
+            if (bayPhase < 0.10 && ((Math.round(bay) % 4) === 0)) {
+              if (d > outer - 3) {
+                for (let y = TR.y + 1; y <= TR.y + 4; y++) set(lx, y, lz, AIR);
+                set(lx, TR.y + 5, lz, TR.accent);           // arch crown
+                set(lx, TR.y, lz, TR.accent);               // threshold
+              }
+            }
+
+            // 4. STAIR FLIGHT climbing from this deck to the one above
+            if (Math.abs(bayPhase - 0.34) < 0.05) {
+              const run = Math.round((d - inner) * 1.1);
+              if (run >= 0 && run <= 10) {
+                set(lx, TR.y + 1 + run, lz, PLANK);
+                for (let c = 1; c <= 3; c++) set(lx, TR.y + 1 + run + c, lz, AIR);
+                set(lx, TR.y + 2 + run, lz, ROPE);          // handline
+              }
+            }
+
+            // 5. DRAPES hung between the columns
+            if (bayPhase > 0.30 && bayPhase < 0.55 && Math.abs(d - (outer - 2)) < 0.7) {
+              for (let c = 1; c <= 3; c++) set(lx, TR.y + 6 - c, lz, BANNER);
+            }
+
+            // 6. BAR COUNTER along the back of every other bay
+            if (bayPhase < 0.45 && ((Math.round(bay) % 3) === 1) && Math.abs(d - (outer - 3)) < 0.9) {
+              set(lx, TR.y + 1, lz, PLANK);
+              if (bayPhase < 0.16) set(lx, TR.y + 3, lz, AWNING);
+              if (bayPhase < 0.08) set(lx, TR.y + 2, lz, TR.glow);
+            }
+
+            // themed dressing
+            if (TR.key === 'jungle' && ((wx * 7 + wz * 11) % 17) === 0) {
+              for (let c = 1; c <= 3; c++) set(lx, TR.y - c, lz, LEAF);
+            }
+            if (TR.key === 'water' && ((wx * 5 + wz * 9) % 23) === 0) set(lx, TR.y + 1, lz, ICE);
+            if (TR.key === 'end' && ((wx * 11 + wz * 5) % 19) === 0) set(lx, TR.y + 3, lz, BANNER);
+          }
+
+          // ---- this district's own mini stage + DJ booth + stacks ----
+          if (TR.djA !== null && TR.djA !== undefined) {
+            const sr = TR.kind === 'room' ? R.inner - 6 : R.rad - 5;
+            const sxp = Math.cos(TR.djA) * sr, szp = Math.sin(TR.djA) * sr;
+            const adx = dx - sxp, adz = dz - szp;
+            if (Math.abs(adx) <= 5 && Math.abs(adz) <= 4) {
+              const onDeckArea = Math.abs(adx) <= 4 && Math.abs(adz) <= 3;
+              if (onDeckArea) {
+                set(lx, TR.y + 1, lz, PLANK);                 // riser
+                for (let y = TR.y + 2; y <= TR.y + 6; y++) set(lx, y, lz, AIR);
+              }
+              // backdrop
+              if (Math.abs(adz) === 4 && Math.abs(adx) <= 4) {
+                for (let y = TR.y + 2; y <= TR.y + 6; y++) {
+                  set(lx, y, lz, ((y - TR.y) % 3 === 0) ? TR.accent : BASALT);
+                }
+              }
+              // decks
+              if (adz === 0 && Math.abs(adx) <= 1) set(lx, TR.y + 2, lz, DECK);
+              // speaker stacks flanking
+              if (Math.abs(adx) === 4 && Math.abs(adz) <= 1) {
+                for (let y = TR.y + 2; y <= TR.y + 5; y++) set(lx, y, lz, SPEAKER);
+                set(lx, TR.y + 6, lz, TR.glow);
+              }
+            }
+          }
+        }
+
+        /* ================= STADIUM SHELL =====================================
+           The decks were reading as floating fragments because nothing tied them
+           together: no outer wall, columns that stubbed out after nine blocks,
+           and paper-thin slab edges. This pass builds the permanent structure -
+           a continuous facade, full-height piers, and deck fascias, so the
+           twenty levels read as one building. */
+        {
+          const ringIn = R.rad - 8, ringOut = R.rad - 1;
+          const ang2 = Math.atan2(dz, dx);
+          const bay2 = ((ang2 + Math.PI) / TAU) * 16;
+          const phase2 = Math.abs((bay2 % 1) - 0.5) * 2;     // 1 at a bay centre
+          const baseY = R.floorY - 2;
+          const capY = R.topY + 9;
+          // A solid podium wall around the lower bowl, open structure above it.
+          // Reads as a real stadium (heavy base, light upper tiers) and costs
+          // roughly half the surface of walling the full 180-block height.
+          const podiumTop = R.floorY + 62;
+
+          // ---- 1. OUTER FACADE: a continuous wall closing the bowl ----
+          if (d > ringOut + 0.2 && d <= R.rad) {
+            const YM = R.yMask;
+            const pier = phase2 > 0.80;
+            const openBay = !pier && phase2 < 0.45;
+            for (let y = baseY; y <= capY; y++) {
+              const m = YM[y];
+              if (y > podiumTop && !pier && !(m & 4)) continue;    // open above the podium
+              if (openBay && (m & 2)) { set(lx, y, lz, AIR); continue; }
+              const panel = ((Math.floor(bay2) + (y >> 3)) & 1);
+              set(lx, y, lz, ((m & 4) || pier) ? SANDSTONE : (panel ? BASALT : OBSIDIAN));
+            }
+            // parapet capping the podium, with lamps on the piers
+            if (phase2 > 0.80) set(lx, podiumTop + 2, lz, LANT_P);
+            set(lx, podiumTop + 1, lz, SANDSTONE);
+            // cornice: the wall gets a lip so it terminates rather than stopping
+            set(lx, capY + 1, lz, SANDSTONE);
+            if (phase2 > 0.80) { set(lx, capY + 2, lz, SANDSTONE); set(lx, capY + 3, lz, LANT_P); }
+          }
+
+          // ---- 2. FULL-HEIGHT PIERS carrying every deck, in one line ----
+          if (phase2 > 0.86 && Math.abs(d - (ringIn + 0.6)) < 1.1) {
+            const YM2 = R.yMask;
+            for (let y = baseY; y <= capY; y++) {
+              if (!(YM2[y] & 1)) set(lx, y, lz, ((y >> 2) & 1) ? SANDSTONE : BASALT);
+            }
+          }
+
+          // ---- 3. DECK FASCIA + SOFFIT: give each slab real thickness ----
+          if (d > ringIn - 0.6 && d <= ringOut) {
+            const YM3 = R.yMask;
+            const near = d < ringIn + 1.6;
+            for (let y = R.floorY - 4; y <= R.topY + 2; y++) {
+              const m = YM3[y];
+              if (m & 8) set(lx, y, lz, BASALT);                        // soffit
+              else if (near && (m & 16)) set(lx, y, lz, SANDSTONE);     // edge beam
+              else if (near && phase2 > 0.55 && (m & 32)) set(lx, y, lz, NEON_C);
+            }
+          }
+        }
+
+        // ---- ladders threading every district together ----
+        for (let q = 0; q < 4; q++) {
+          const qa = q * (TAU / 4) + 0.4;
+          const qx = Math.round(Math.cos(qa) * (R.rad - 3)), qz = Math.round(Math.sin(qa) * (R.rad - 3));
+          if (dx === qx && dz === qz) {
+            for (let y = R.floorY + 1; y <= R.topY + 2; y++) set(lx, y, lz, ROPE);
+          }
+        }
+        // stairwells down into the two underground rooms
+        for (const sgn of [-1, 1]) {
+          if (Math.abs(dz - sgn * 26) <= 1 && Math.abs(dx) <= 2) {
+            const bottom = R.tiers[0].y;
+            for (let k2 = 0; k2 <= R.floorY - bottom; k2++) {
+              const y = R.floorY - k2;
+              const along = Math.round(dx + 2);
+              if (k2 >= along * 2 && k2 <= along * 2 + 8) {
+                set(lx, y, lz, PLANK);
+                for (let c = 1; c <= 3; c++) set(lx, y + c, lz, AIR);
+              }
+            }
+          }
+        }
+
+        // ================= THE GALLEON =========================================
+        {
+          const SP = R.ship;
+          const u = wz - SP.z, v = wx - SP.x;             // along keel, across beam
+          if (Math.abs(u) <= SP.L + 2 && Math.abs(v) <= SP.B + 3) {
+            const tt = Math.abs(u) / SP.L;
+            if (tt <= 1.02) {
+              // beam tapers to a point at bow and stern
+              const beam = SP.B * Math.pow(Math.max(0, 1 - Math.pow(tt, 2.4)), 0.55);
+              const av = Math.abs(v);
+              const deckY = u > SP.L * 0.45 ? SP.fdeck : (u < -SP.L * 0.42 ? SP.qdeck : SP.deck);
+
+              if (beam >= 0.9) {
+                // hull: a shell, not a solid block of wood
+                for (let y = SP.keel; y <= deckY; y++) {
+                  const rise = (y - SP.keel) / Math.max(1, deckY - SP.keel);
+                  const wid = beam * (0.35 + 0.65 * Math.pow(rise, 0.6));
+                  if (av <= wid) {
+                    const shell = av > wid - 1.25 || y === SP.keel;
+                    if (shell) set(lx, y, lz, ((y + Math.round(u)) % 7 === 0) ? LOG : PLANK);
+                    else set(lx, y, lz, AIR);            // hold space below decks
+                  }
+                }
+                // the deck itself
+                const dw = beam * 0.94;
+                if (av <= dw) {
+                  set(lx, deckY, lz, ((Math.round(u) + Math.round(v)) % 9 === 0) ? LOG : PLANK);
+                  for (let y = deckY + 1; y <= deckY + 6; y++) set(lx, y, lz, AIR);
+                }
+                // gunwale rail
+                if (av > dw - 1 && av <= dw + 0.4) {
+                  set(lx, deckY + 1, lz, LOG);
+                  if ((Math.round(u) % 5) === 0) set(lx, deckY + 2, lz, LANT_P);
+                }
+                // stern castle wall
+                if (u < -SP.L * 0.42 && Math.abs(u + SP.L * 0.42) < 1.2 && av <= dw) {
+                  for (let y = SP.deck; y <= SP.qdeck; y++) set(lx, y, lz, PLANK);
+                }
+                // jungle reclaiming the hull
+                if (av <= dw + 1 && rnd2(wx, wz, 9911) < 0.20) {
+                  set(lx, deckY + 1, lz, LEAF);
+                }
+                if (av > wid0(beam) && rnd2(wx, wz, 7717) < 0.16) {
+                  for (let c = 1; c <= 2; c++) set(lx, deckY - c, lz, LEAF);
+                }
+              }
+
+              // ---- masts, yards, sails, rigging ----
+              for (const m of [{ o: 11, h: 1.0 }, { o: -2, h: 1.15 }, { o: -14, h: 0.85 }]) {
+                if (Math.round(u) === m.o && Math.abs(v) <= 0) {
+                  const top = SP.deck + Math.round((SP.mastTop - SP.deck) * m.h);
+                  for (let y = SP.deck; y <= top; y++) set(lx, y, lz, LOG);
+                  set(lx, top + 1, lz, LANT_P);
+                }
+                // yards + furled sails
+                for (const yd of [0.45, 0.72]) {
+                  const yy = Math.round(SP.deck + (SP.mastTop - SP.deck) * m.h * yd);
+                  if (Math.round(u) === m.o && Math.abs(v) <= 7) set(lx, yy, lz, LOG);
+                  if (Math.round(u) === m.o && Math.abs(v) <= 6) {
+                    for (let c = 1; c <= 3; c++) set(lx, yy - c, lz, BANNER);
+                  }
+                }
+                // crow's nest
+                if (Math.abs(Math.round(u) - m.o) <= 1 && Math.abs(v) <= 1) {
+                  const cy = Math.round(SP.deck + (SP.mastTop - SP.deck) * m.h * 0.86);
+                  set(lx, cy, lz, PLANK);
+                }
+                // shrouds running down to the rail
+                if (Math.abs(Math.round(u) - m.o) <= 4 && Math.abs(av - Math.abs(Math.round(u) - m.o)) < 0.7) {
+                  const ry = SP.deck + 2 + (4 - Math.abs(Math.round(u) - m.o)) * 3;
+                  set(lx, ry, lz, ROPE);
+                }
+              }
+              // bowsprit
+              if (u > SP.L * 0.86 && Math.abs(v) <= 0) set(lx, SP.fdeck + 2 + Math.round((u - SP.L * 0.86)), lz, LOG);
+            }
+          }
+        }
+
+        // ---- the stage ----
+        if (onStage) {
+          for (let y = R.floorY; y < R.stageTop; y++) set(lx, y, lz, BASALT);
+          set(lx, R.stageTop, lz, PLANK);
+          if (dz === R.stageZ1 && ((wx & 1) === 0)) set(lx, R.stageTop, lz, NEON_M);
+        }
+
+        elevatorColumn(lx, lz, dx, dz);
+
+        /* ================= THE ASTRONAUTS ====================================
+           Two giant figures flanking the stage, turned back-to-back so each
+           looks away down its own side of the bowl. Built from the venue's own
+           palette so they read as monuments rather than props. */
+        for (const side of [-1, 1]) {
+          const AX = side * (R.stageX + 7);          // stands just outside the stage
+          const AZ = R.stageZ0 + 5;
+          const ax2 = dx - AX, az2 = dz - AZ;
+          if (Math.abs(ax2) > 9 || Math.abs(az2) > 7) continue;
+          const base = R.floorY + 1;
+          // "front" is the direction this one faces: outward, opposite its twin
+          const f = side;                             // +1 faces +x, -1 faces -x
+          const fw = ax2 * f;                         // depth along facing axis
+          const sw = az2;                             // sideways
+          const H = 26;
+
+          // plinth
+          if (Math.abs(ax2) <= 6 && Math.abs(sw) <= 5) {
+            for (let y = base; y <= base + 2; y++) set(lx, y, lz, SANDSTONE);
+            if (Math.abs(ax2) === 6 || Math.abs(sw) === 5) set(lx, base + 3, lz, NEON_C);
+          }
+          const y0 = base + 3;
+
+          // legs
+          if (Math.abs(sw) >= 1 && Math.abs(sw) <= 2 && Math.abs(fw) <= 2) {
+            for (let y = y0; y <= y0 + 8; y++) set(lx, y, lz, ICE);
+            if (Math.abs(sw) === 2) set(lx, y0, lz, OBSIDIAN);      // boots
+          }
+          // torso
+          if (Math.abs(sw) <= 3 && Math.abs(fw) <= 2) {
+            for (let y = y0 + 9; y <= y0 + 17; y++) set(lx, y, lz, ICE);
+            // chest control panel on the facing side
+            if (fw === 2 && Math.abs(sw) <= 1) {
+              set(lx, y0 + 14, lz, NEON_M);
+              set(lx, y0 + 13, lz, NEON_C);
+            }
+          }
+          // life-support pack on the back
+          if (fw >= -3 && fw <= -2 && Math.abs(sw) <= 2) {
+            for (let y = y0 + 10; y <= y0 + 16; y++) set(lx, y, lz, BASALT);
+            if (Math.abs(sw) === 0) set(lx, y0 + 16, lz, MAGMA);     // thruster glow
+          }
+          // arms, the outward one raised, the inner one down
+          if (Math.abs(sw) === 4 && Math.abs(fw) <= 1) {
+            const raised = (sw > 0) === (side > 0);
+            const top = raised ? y0 + 21 : y0 + 16;
+            for (let y = y0 + 10; y <= top; y++) set(lx, y, lz, ICE);
+            if (raised) set(lx, top + 1, lz, LANT_P);               // holding a light
+          }
+          // helmet
+          if (Math.abs(sw) <= 3 && Math.abs(fw) <= 3) {
+            const hy = y0 + 18;
+            const r2 = Math.hypot(sw, fw);
+            if (r2 <= 3.4) {
+              for (let y = hy; y <= hy + 5; y++) set(lx, y, lz, ICE);
+              // visor faces outward
+              if (fw >= 1 && Math.abs(sw) <= 2) {
+                for (let y = hy + 1; y <= hy + 3; y++) set(lx, y, lz, LITGLASS);
+              }
+              if (r2 < 1.2) set(lx, hy + 6, lz, NEON_C);            // antenna
+            }
+          }
+          void H;
+        }
+
+        /* ---- DJ BOOTH: a raised riser carrying a full deck layout ---- */
+        {
+          const rz0 = R.deckZ - 2, rz1 = R.deckZ + 2;          // riser footprint
+          const inRiser = dz >= rz0 && dz <= rz1 && Math.abs(dx) <= 6;
+          const RISE = 3;                                       // booth stands proud of the stage
+          if (inRiser) {
+            for (let y = R.stageTop + 1; y <= R.stageTop + RISE; y++) set(lx, y, lz, BASALT);
+            set(lx, R.stageTop + RISE, lz, PLANK);              // booth floor
+            for (let y = R.stageTop + RISE + 1; y <= R.stageTop + RISE + 5; y++) set(lx, y, lz, AIR);
+            // lit fascia around the riser edge
+            if (dz === rz1 || Math.abs(dx) === 6) {
+              set(lx, R.stageTop + RISE - 1, lz, ((wx + wz) & 1) ? NEON_M : NEON_C);
+            }
+          }
+          // steps up to the booth on both flanks
+          for (const sgn of [-1, 1]) {
+            if (dz === R.deckZ && Math.abs(dx - sgn * 8) <= 1) {
+              const st = Math.abs(dx) - 6;
+              if (st >= 1 && st <= RISE) set(lx, R.stageTop + (RISE - st) + 1, lz, PLANK);
+            }
+          }
+          // ---- the deck layout: four players around a central mixer ----
+          const topY = R.stageTop + RISE;
+          if (dz === R.deckZ) {
+            if (Math.abs(dx) === 1) { set(lx, topY + 1, lz, BASALT); set(lx, topY + 2, lz, DECK); }   // mixer
+            if (Math.abs(dx) === 3) { set(lx, topY + 1, lz, BASALT); set(lx, topY + 2, lz, DECK); }   // inner players
+            if (Math.abs(dx) === 5) { set(lx, topY + 1, lz, BASALT); set(lx, topY + 2, lz, DECK); }   // outer players
+          }
+          // table skirt so the gear sits on furniture, not on air
+          if (dz === R.deckZ + 1 && Math.abs(dx) <= 5) set(lx, topY + 1, lz, OBSIDIAN);
+          // monitor wedges angled at the DJ
+          if (dz === R.deckZ + 2 && (Math.abs(dx) === 2 || Math.abs(dx) === 4)) {
+            set(lx, topY + 1, lz, SPEAKER);
+          }
+          // rack of effects behind the booth
+          if (dz === R.deckZ - 2 && Math.abs(dx) <= 3) {
+            set(lx, topY + 1, lz, OBSIDIAN);
+            set(lx, topY + 2, lz, ((wx & 1) ? NEON_C : NEON_M));
+          }
+          // cable runs along the stage lip
+          if (dz === R.deckZ + 3 && (wx % 3 === 0) && Math.abs(dx) <= 7) set(lx, R.stageTop + 1, lz, LOG);
+        }
+
+        // ---- main PA: two speaker towers flanking the stage ----
+        if ((Math.abs(dx) >= 17 && Math.abs(dx) <= 18) && dz >= R.stageZ0 + 1 && dz <= R.stageZ0 + 4) {
+          for (let y = R.floorY + 1; y <= R.floorY + 9; y++) set(lx, y, lz, SPEAKER);
+          set(lx, R.floorY + 10, lz, ((wx + wz) & 1) ? NEON_M : NEON_C);
+        }
+        // ---- delay towers mid-bowl, festival style ----
+        if ((Math.abs(Math.abs(dx) - 24) <= 0) && Math.abs(dz - 6) <= 0) {
+          for (let y = R.floorY + 1; y <= R.floorY + 6; y++) set(lx, y, lz, SPEAKER);
+          set(lx, R.floorY + 7, lz, LANTERN);
+        }
+
+        // ---- backdrop wall (taller, mainstage) + banner pylons + truss ----
+        if (dz === R.stageZ0 - 1 && Math.abs(dx) <= R.stageX + 1) {
+          for (let y = R.floorY + 1; y <= R.floorY + 16; y++) {
+            const band = (y - R.floorY) % 4 === 0;
+            set(lx, y, lz, band ? (((wx >> 1) & 1) ? NEON_M : NEON_C) : BASALT);
+          }
+        }
+        if (dz === R.stageZ0 && Math.abs(dx) === R.stageX + 2) {
+          for (let y = R.stageTop; y <= R.floorY + 18; y++) set(lx, y, lz, LOG);
+          set(lx, R.floorY + 18, lz, LANTERN);
+        }
+        if (dz === R.stageZ1 + 1 && Math.abs(dx) <= R.stageX + 1) {
+          const ty = R.floorY + 13;
+          set(lx, ty, lz, LOG);
+          if (Math.abs(dx) % 3 === 0) set(lx, ty - 1, lz, LANTERN);
+        }
+      }
+    }
+  }
+  key(cx, cz) { return cx + ',' + cz; }
+
+  /* --- terrain field --- */
+  column(wx, wz) {
+    const n = this.n;
+    // domain warp for organic coastlines
+    const wxx = wx + n.fbm2(wx * 0.0075 + 41.3, wz * 0.0075 - 17.9, 2) * 26;
+    const wzz = wz + n.fbm2(wx * 0.0075 - 23.1, wz * 0.0075 + 8.7, 2) * 26;
+
+    // ~0.0052 puts island diameters around 120-220 blocks, so a whole island
+    // plus its reef ring and its neighbours fit inside normal view distance
+    const land = n.fbm2(wxx * 0.0052, wzz * 0.0052, 5) * 0.5 + 0.5;   // 0..1
+    const mask = smoothstep(0.505, 0.665, land);
+    const ridge = 1 - Math.abs(n.fbm2(wxx * 0.011, wzz * 0.011, 3));
+
+    let h = SEA - 11 + mask * (25 + 20 * ridge * mask);
+    h += n.fbm2(wx * 0.030, wz * 0.030, 3) * 2.6 * mask;              // dunes
+    if (land < 0.44) h -= (0.44 - land) * 46;                          // ocean shelf drop
+
+    // barrier reef ring: a band just seaward of the island mask
+    const band = 1 - smoothstep(0, 0.070, Math.abs(land - 0.485));
+    if (band > 0 && h < SEA - 1) {
+      const rn = n.fbm2(wx * 0.055, wz * 0.055, 2);
+      const crest = SEA - 2.6 + band * 3.4 + rn * 1.9;
+      if (crest > h) h = h + (crest - h) * band;
+    }
+    // lagoon scoop between reef and beach
+    const lag = 1 - smoothstep(0, 0.065, Math.abs(land - 0.548));
+    h -= lag * 2.2;
+
+    return { h: Math.max(2, Math.min(MAXY - 6, h)), land, mask, band };
+  }
+
+  genChunk(cx, cz) {
+    const vox = new Uint8Array(CS * WH * CS);
+    const n = this.n;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+
+    const hs = new Float32Array(CS * CS);
+    const lands = new Float32Array(CS * CS);
+    for (let z = 0; z < CS; z++) for (let x = 0; x < CS; x++) {
+      const c = this.column(cx * CS + x, cz * CS + z);
+      hs[z * CS + x] = c.h; lands[z * CS + x] = c.land;
+    }
+
+    for (let z = 0; z < CS; z++) {
+      for (let x = 0; x < CS; x++) {
+        const wx = cx * CS + x, wz = cz * CS + z;
+        const hf = hs[z * CS + x];
+        const top = Math.floor(hf);
+        const beach = top >= SEA - 4 && top <= SEA + 3;
+        const high = top > SEA + 19;
+
+        for (let y = 0; y <= top; y++) {
+          let id;
+          if (y === 0) id = BEDROCK;
+          else if (y === top) {
+            if (top > SEA + 2) id = beach ? SAND : (high ? BASALT : GRASS);
+            else id = (top >= SEA - 9) ? SAND : STONE;
+          } else if (y > top - 4) {
+            id = (top > SEA + 2 && !beach) ? (high ? BASALT : DIRT) : (top >= SEA - 9 ? SAND : STONE);
+          } else if (y > top - 8 && top >= SEA - 9 && top <= SEA + 6) id = SANDSTONE;
+          else id = high && y > SEA + 14 ? BASALT : STONE;
+
+          // caves, island interiors only, so the seabed never leaks
+          if (id !== BEDROCK && y > 2 && y < top - 4 && top > SEA + 3) {
+            const a = Math.abs(n.n3(wx * 0.045, y * 0.070, wz * 0.045));
+            if (a < 0.095) {
+              const b = Math.abs(n.n3(wx * 0.045 + 91.7, y * 0.070 - 33.1, wz * 0.045 + 12.4));
+              if (b < 0.105) id = AIR;
+            }
+          }
+          vox[idx(x, y, z)] = id;
+        }
+        for (let y = top + 1; y <= SEA; y++) vox[idx(x, y, z)] = WATER;
+      }
+    }
+
+    const ch = { cx, cz, vox, heights: new Int16Array(CS * CS), lights: [], dirty: true, decorated: false };
+    this.chunks.set(this.key(cx, cz), ch);
+    this.decorate(ch, hs, lands);
+    this.applyRave(ch);
+    applyCity(this, ch);
+    this.applyPortal(ch);
+    this.applySkyIsles(ch);
+    this.applyAerie(ch);
+    this.applyLighthouse(ch);
+    this.applyEdits(ch);
+    this.recalcHeights(ch);
+    return ch;
+  }
+
+  /* features are generated over a padded footprint and clipped into this
+     chunk only, guarantees palms/coral straddle chunk borders seamlessly */
+  decorate(ch, hs, lands) {
+    const { cx, cz, vox } = ch;
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    const put = (wx, wy, wz, id, overwrite) => {
+      const lx = wx - cx * CS, lz = wz - cz * CS;
+      if (lx < 0 || lz < 0 || lx >= CS || lz >= CS || wy < 0 || wy > MAXY) return;
+      const cur = vox[idx(lx, wy, lz)];
+      if (!overwrite && cur !== AIR && cur !== WATER) return;
+      vox[idx(lx, wy, lz)] = id;
+    };
+    const R = 10;
+    for (let dz = -R; dz < CS + R; dz++) {
+      for (let dx = -R; dx < CS + R; dx++) {
+        const wx = cx * CS + dx, wz = cz * CS + dz;
+        let h, land;
+        if (dx >= 0 && dz >= 0 && dx < CS && dz < CS) { h = hs[dz * CS + dx]; land = lands[dz * CS + dx]; }
+        else { const c = this.column(wx, wz); h = c.h; land = c.land; }
+        const top = Math.floor(h);
+
+        // ---- palms on dry sand / grass ----
+        if (top > SEA + 1 && top < SEA + 18) {
+          const nearShore = top <= SEA + 5;
+          const p = nearShore ? 0.030 : 0.010;
+          if (rnd2(wx, wz, this.seed ^ 0x50a1) < p) {
+            const tall = 5 + Math.floor(rnd2(wx, wz, 991) * 4);
+            const leanX = rnd2(wx, wz, 313) < 0.5 ? -1 : 1;
+            const leanAt = tall - 2;
+            let ox = 0;
+            for (let y = 1; y <= tall; y++) {
+              if (y === leanAt) ox += leanX;
+              put(wx + ox, top + y, wz, LOG, true);
+            }
+            const cyy = top + tall, cxx = wx + ox;
+            // radiating fronds
+            const arms = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+            put(cxx, cyy + 1, wz, LEAF);
+            for (const a of arms) {
+              put(cxx + a[0], cyy + 1, wz + a[1], LEAF);
+              put(cxx + a[0] * 2, cyy, wz + a[1] * 2, LEAF);
+              if (Math.abs(a[0]) + Math.abs(a[1]) === 1) put(cxx + a[0] * 3, cyy - 1, wz + a[1] * 3, LEAF);
+            }
+          } else if (top > SEA + 6 && top < SEA + 17 && !nearShore && rnd2(wx, wz, 6688) < 0.007) {
+            // broadleaf tree: straight trunk, a domed crown, a few roots
+            const tall = 4 + Math.floor(rnd2(wx, wz, 6689) * 3);
+            const cr = 2.4 + rnd2(wx, wz, 6690) * 1.2;
+            for (let y = 1; y <= tall; y++) put(wx, top + y, wz, LOG, true);
+            for (const [rx, rz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (rnd2(wx + rx, wz + rz, 6691) < 0.5) put(wx + rx, top + 1, wz + rz, LOG, false);
+            const cy = top + tall;
+            for (let ox = -3; ox <= 3; ox++) for (let oz = -3; oz <= 3; oz++) for (let oy = -1; oy <= 2; oy++) {
+              const q = (ox * ox + oz * oz) / (cr * cr) + (oy - 0.4) * (oy - 0.4) / 2.4;
+              if (q <= 1 && !(q > 0.72 && rnd2(wx + ox * 7 + oy, wz + oz * 13, 6692) > 0.8)) put(wx + ox, cy + oy, wz + oz, LEAF, false);
+            }
+            put(wx, cy + 3, wz, LEAF, false);
+          } else if (top > SEA + 3 && rnd2(wx, wz, 4477) < 0.018) {
+            // shrub
+            put(wx, top + 1, wz, LEAF); put(wx + 1, top + 1, wz, LEAF); put(wx, top + 1, wz + 1, LEAF);
+          }
+        }
+
+        // ---- rock outcrops on the ridge slopes ----
+        if (top > SEA + 11 && rnd2(wx, wz, 7311) < 0.0045) {
+          const rr = 1.6 + rnd2(wx, wz, 7312) * 1.6;
+          const bury = 1 + ((rnd2(wx, wz, 7313) * 2) | 0);
+          for (let ox = -3; ox <= 3; ox++) for (let oz = -3; oz <= 3; oz++) for (let oy = -bury; oy <= 3; oy++) {
+            const q = (ox * ox + oz * oz) / (rr * rr) + (oy + bury * 0.5) * (oy + bury * 0.5) / (rr * rr * 0.9);
+            if (q <= 1) put(wx + ox, top + 1 + oy, wz + oz, (q > 0.6 && rnd2(wx + ox, wz + oz, 7314) < 0.3) ? BASALT : STONE, oy <= 0);
+          }
+        }
+
+        // ---- reef coral in the shallows ----
+        const depth = SEA - top;
+        if (depth >= 1 && depth <= 8 && land > 0.40) {
+          const dens = 0.070 + 0.20 * (1 - smoothstep(0, 0.075, Math.abs(land - 0.485)));
+          if (rnd2(wx, wz, this.seed ^ 0x0c0a) < dens) {
+            const pick = [COR_P, COR_O, COR_U, COR_T][(rnd2(wx, wz, 77) * 4) | 0];
+            const stack = 1 + ((rnd2(wx, wz, 131) * 2.2) | 0);
+            for (let y = 1; y <= stack && top + y < SEA; y++) put(wx, top + y, wz, pick, true);
+            if (rnd2(wx, wz, 555) < 0.35) put(wx + 1, top + 1, wz, pick, true);
+            if (rnd2(wx, wz, 556) < 0.35) put(wx, top + 1, wz + 1, pick, true);
+          }
+        }
+
+        // ---- driftwood / shoreline rock ----
+        if (top >= SEA && top <= SEA + 2 && rnd2(wx, wz, 8123) < 0.004) {
+          put(wx, top + 1, wz, BASALT, true); put(wx + 1, top + 1, wz, BASALT, true);
+        }
+      }
+    }
+    ch.decorated = true;
+  }
+
+  applyEdits(ch) {
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    for (const [k, id] of this.edits) {
+      const p = k.split(',');
+      const wx = +p[0], wy = +p[1], wz = +p[2];
+      if ((wx >> 4) === ch.cx && (wz >> 4) === ch.cz) {
+        ch.vox[idx(wx - ch.cx * CS, wy, wz - ch.cz * CS)] = id;
+        if (id === LANTERN) ch.lights.push([wx, wy, wz]);
+      }
+    }
+  }
+
+  recalcHeights(ch) {
+    const idx = (x, y, z) => x + CS * (z + CS * y);
+    for (let z = 0; z < CS; z++) for (let x = 0; x < CS; x++) {
+      let t = 0;
+      for (let y = MAXY; y >= 0; y--) { if (isOpaque(ch.vox[idx(x, y, z)])) { t = y; break; } }
+      ch.heights[z * CS + x] = t;
+    }
+    // Per-layer occupancy. Sky islands push maxY to the top of the world, so a
+    // plain 0..maxY sweep grinds through ~100 empty layers per chunk, this lets
+    // the mesher skip them in one test instead.
+    if (!ch.layerUsed) ch.layerUsed = new Uint8Array(WH);
+    const LU = ch.layerUsed;
+    let my = 0;
+    for (let y = 0; y < WH; y++) {
+      const base = CS * CS * y;
+      let used = 0;
+      for (let i = 0; i < CS * CS; i++) if (ch.vox[base + i] !== AIR) { used = 1; break; }
+      LU[y] = used;
+      if (used) my = y;
+    }
+    ch.maxY = my;
+  }
+
+  ensure(cx, cz) {
+    const k = this.key(cx, cz);
+    let c = this.chunks.get(k);
+    if (!c) c = this.genChunk(cx, cz);
+    return c;
+  }
+  get(wx, wy, wz) {
+    if (wy < 0 || wy > MAXY) return wy < 0 ? BEDROCK : AIR;
+    const cx = wx >> 4, cz = wz >> 4;
+    const c = this.chunks.get(this.key(cx, cz));
+    if (!c) return AIR;
+    return c.vox[(wx - cx * CS) + CS * ((wz - cz * CS) + CS * wy)];
+  }
+  set(wx, wy, wz, id) {
+    if (wy < 0 || wy > MAXY) return false;
+    const cx = wx >> 4, cz = wz >> 4;
+    const c = this.chunks.get(this.key(cx, cz));
+    if (!c) return false;
+    const vi = (wx - cx * CS) + CS * ((wz - cz * CS) + CS * wy);
+    const prev = c.vox[vi];
+    c.vox[vi] = id;
+    if (prev === LANTERN) c.lights = c.lights.filter((l) => !(l[0] === wx && l[1] === wy && l[2] === wz));
+    if (id === LANTERN) c.lights.push([wx, wy, wz]);
+    this.edits.set(wx + ',' + wy + ',' + wz, id);
+    this.recalcHeights(c);
+    c.dirty = true;
+    // dirty neighbours if on a border
+    const lx = wx - cx * CS, lz = wz - cz * CS;
+    const mark = (dx, dz) => { const n = this.chunks.get(this.key(cx + dx, cz + dz)); if (n) n.dirty = true; };
+    if (lx === 0) mark(-1, 0); if (lx === CS - 1) mark(1, 0);
+    if (lz === 0) mark(0, -1); if (lz === CS - 1) mark(0, 1);
+    return true;
+  }
+  topOpaque(wx, wz) {
+    const cx = wx >> 4, cz = wz >> 4;
+    const c = this.chunks.get(this.key(cx, cz));
+    if (!c) return SEA;
+    return c.heights[(wz - cz * CS) * CS + (wx - cx * CS)];
+  }
+  // cheap skylight: 0..1, softened by neighbouring columns
+  sky(wx, wy, wz) {
+    let best = 0;
+    for (let i = 0; i < 5; i++) {
+      const ox = i === 1 ? 1 : i === 2 ? -1 : 0;
+      const oz = i === 3 ? 1 : i === 4 ? -1 : 0;
+      const t = this.topOpaque(wx + ox, wz + oz);
+      let v = wy > t ? 1 : Math.max(0, 1 - (t - wy) * 0.19);
+      if (i > 0) v -= 0.12;
+      if (v > best) best = v;
+    }
+    return clamp(best, 0, 1);
+  }
+}
+
+/* ==================== THE CANOPY CITY ====================
+   A ring of greatwood trees on the volcano's flanks, encircling the rave
+   crater. Every structure is a pure function of world (x,z) so it generates
+   seamlessly per chunk with no cross-chunk writes and no edit bookkeeping. */
+
+const TAU = Math.PI * 2;
+const angDist = (a, b) => Math.abs(((a - b + Math.PI * 3) % TAU) - Math.PI);
+/* Camera convention: yaw 0 looks down -z; forward = (-sin yaw, -cos yaw).
+   Every "face toward X" in the game goes through this so the sign lives in
+   exactly one place. North is -z, east is +x. */
+const faceYaw = (fx, fz, tx, tz) => Math.atan2(-(tx - fx), -(tz - fz));
+const COMPASS8 = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const bearingName = (dx, dz) => COMPASS8[(Math.round(Math.atan2(dx, -dz) / (Math.PI / 4)) + 8) % 8];
+
+function buildCity(W) {
+  const R = W.rave;
+  if (!R) return null;
+  const S = W.seed;
+  const trees = [], bridges = [], pads = [];
+  // One tree per 30-degree sector: coverage is then guaranteed by construction
+  // rather than left to chance, and the canopies nearly touch at ring radius.
+  const N = 12;
+
+  for (let i = 0; i < N; i++) {
+    const sector = TAU / N;
+    // keep every tree inside its own arc, drift wider than a sector lets two
+    // trees share a bearing and leaves a hole in the skyline somewhere else
+    const ang = (i / N) * TAU + (rnd2(i, 11, S) - 0.5) * sector * 0.10;
+    let site = null;
+    // Close the ring completely: sweep the bearing wider AND relax the height
+    // band on each pass. A sector with no site leaves a hole in the skyline,
+    // which is exactly what the 360 build-out is supposed to prevent.
+    for (let pass = 0; pass < 9 && !site; pass++) {
+      const wob = clamp(((pass % 2 ? 1 : -1) * Math.ceil(pass / 2)) * 0.05,
+                        -sector * 0.18, sector * 0.18);
+      const loSlack = pass * 1.1, hiSlack = pass * 3.0;
+      const maxRad = R.rad + 104 + pass * 12;
+      for (let rad = Math.max(44, R.rad + 18); rad <= maxRad; rad += 3) {
+        const x = Math.round(R.x + Math.cos(ang + wob) * rad);
+        const z = Math.round(R.z + Math.sin(ang + wob) * rad);
+        const h = W.column(x, z).h;
+        if (h > SEA + 4 - loSlack && h < SEA + 26 + hiSlack) {
+          site = { x, z, base: Math.floor(h), rad }; break;
+        }
+      }
+    }
+    // last resort: a stilted platform tree on whatever ground the bearing offers
+    if (!site) {
+      for (let rad = R.rad + 20; rad <= R.rad + 150; rad += 4) {
+        const x = Math.round(R.x + Math.cos(ang) * rad);
+        const z = Math.round(R.z + Math.sin(ang) * rad);
+        const h = W.column(x, z).h;
+        if (h > SEA + 1) { site = { x, z, base: Math.floor(h), rad }; break; }
+      }
+    }
+    if (!site) continue;
+
+    const big = trees.length === 0;                       // the first one is the mother tree
+    const inward = Math.atan2(R.z - site.z, R.x - site.x); // bearing back to the crater
+    const H = big ? 62 : 46 + Math.round(rnd2(i, 5, S) * 12);   // sky city
+    const t = {
+      x: site.x, z: site.z, base: site.base, ang, inward, big,
+      r0: big ? 4.3 : 3.1 + rnd2(i, 3, S) * 0.9,
+      r1: big ? 2.1 : 1.5,
+      top: Math.min(MAXY - 4, site.base + H),
+      decks: [], huts: [], branches: [], canopy: [], reach: 0
+    };
+    const span = t.top - t.base;
+
+    // ---- tiered decks ----
+    const levels = big ? [0.30, 0.46, 0.62, 0.78] : [0.32, 0.50, 0.68];
+    levels.forEach((f, k) => {
+      const y = t.base + Math.round(span * f);
+      const r = (big ? 11.0 : 9.0) - k * 1.3 + rnd2(i * 7 + k, 9, S) * 0.8;
+      t.decks.push({ y, r, gaps: [], posts: 30 });
+    });
+
+    // ---- huts: 1-2 per deck, set back from the rim ----
+    t.decks.forEach((dk, k) => {
+      const count = k === 0 ? 3 : 2;
+      for (let j = 0; j < count; j++) {
+        const a = t.ang + Math.PI + (j - (count - 1) / 2) * 1.25 + rnd2(i * 13 + k * 3 + j, 17, S) * 0.35;
+        const rr = dk.r - 3.6;
+        const tall = rnd2(i * 31 + k * 5 + j, 41, S);
+        t.huts.push({
+          x: Math.round(t.x + Math.cos(a) * rr), z: Math.round(t.z + Math.sin(a) * rr),
+          y: dk.y + 1, w: tall > 0.6 ? 3 : 2, d: 2, h: tall > 0.6 ? 6 : 4, a,
+          loft: tall > 0.6, lantern: rnd2(i * 17 + j, 53, S) > 0.35,
+          banner: rnd2(i * 19 + k, 59, S) > 0.5
+        });
+      }
+    });
+
+    // ---- limbs and canopy ----
+    const nb = big ? 5 : 4;
+    for (let k = 0; k < nb; k++) {
+      const a = t.ang + k * (TAU / nb) + rnd2(i * 5 + k, 23, S) * 0.5;
+      const y0 = t.base + Math.round(span * (0.62 + 0.10 * (k % 3)));
+      const len = (big ? 11 : 8) + rnd2(i * 3 + k, 29, S) * 4;
+      const rise = 0.34 + rnd2(i + k, 31, S) * 0.22;
+      t.branches.push({ a, y0, len, rise });
+      t.canopy.push({
+        x: t.x + Math.cos(a) * len, z: t.z + Math.sin(a) * len,
+        y: y0 + rise * len + 1, r: (big ? 6.6 : 5.4) + rnd2(i * 9 + k, 37, S) * 1.4
+      });
+    }
+    t.canopy.push({ x: t.x, z: t.z, y: t.top + 1, r: big ? 9.2 : 7.4 });
+
+    let reach = t.r0 + 4;
+    for (const d of t.decks) reach = Math.max(reach, d.r + 1.5);
+    for (const c of t.canopy) reach = Math.max(reach, Math.hypot(c.x - t.x, c.z - t.z) + c.r + 1);
+    t.reach = reach;
+    trees.push(t);
+  }
+
+  if (trees.length < 2) return null;
+
+  // ---- rope bridges: ring first, then spokes down to the crater rim ----
+  const link = (A, B, ay, by, sag) => {
+    const a = Math.atan2(B.z - A.z, B.x - A.x);
+    const ar = A.decks[0].r - 0.6, br = B.decks ? B.decks[0].r - 0.6 : 0;
+    const ax = A.x + Math.cos(a) * ar, az = A.z + Math.sin(a) * ar;
+    const bx = B.x - Math.cos(a) * br, bz = B.z - Math.sin(a) * br;
+    A.decks[0].gaps.push(a);
+    if (B.decks) B.decks[0].gaps.push(a + Math.PI);
+    bridges.push({
+      ax, az, ay, bx, bz, by, sag,
+      minX: Math.min(ax, bx) - 4, maxX: Math.max(ax, bx) + 4,
+      minZ: Math.min(az, bz) - 4, maxZ: Math.max(az, bz) + 4
+    });
+  };
+
+  for (let i = 0; i < trees.length; i++) {
+    const A = trees[i], B = trees[(i + 1) % trees.length];
+    if (trees.length === 2 && i === 1) break;
+    const d = Math.hypot(B.x - A.x, B.z - A.z);
+    if (d > 78) continue;
+    link(A, B, A.decks[0].y, B.decks[0].y, 2.2 + d * 0.035);
+  }
+
+  // two spokes into the rave, landing on the crater rim
+  const byRave = trees.slice().sort((a, b) =>
+    Math.hypot(a.x - R.x, a.z - R.z) - Math.hypot(b.x - R.x, b.z - R.z));
+  for (const t of byRave.slice(0, 2)) {
+    const a = Math.atan2(R.z - t.z, R.x - t.x);
+    const landX = Math.round(R.x - Math.cos(a) * (R.rad - 1));
+    const landZ = Math.round(R.z - Math.sin(a) * (R.rad - 1));
+    const landY = R.floorY + 9;
+    const ar = t.decks[0].r - 0.6;
+    const ax = t.x + Math.cos(a) * ar, az = t.z + Math.sin(a) * ar;
+    t.decks[0].gaps.push(a);
+    bridges.push({
+      ax, az, ay: t.decks[0].y, bx: landX, bz: landZ, by: landY, sag: 3.0,
+      minX: Math.min(ax, landX) - 4, maxX: Math.max(ax, landX) + 4,
+      minZ: Math.min(az, landZ) - 4, maxZ: Math.max(az, landZ) + 4
+    });
+    pads.push({ x: landX, z: landZ, y: landY, r: 3, toward: a });
+  }
+
+  let minX = 1e9, maxX = -1e9, minZ = 1e9, maxZ = -1e9;
+  for (const t of trees) {
+    minX = Math.min(minX, t.x - t.reach); maxX = Math.max(maxX, t.x + t.reach);
+    minZ = Math.min(minZ, t.z - t.reach); maxZ = Math.max(maxZ, t.z + t.reach);
+  }
+  for (const b of bridges) {
+    minX = Math.min(minX, b.minX); maxX = Math.max(maxX, b.maxX);
+    minZ = Math.min(minZ, b.minZ); maxZ = Math.max(maxZ, b.maxZ);
+  }
+  const cx = trees.reduce((s, t) => s + t.x, 0) / trees.length;
+  const cz = trees.reduce((s, t) => s + t.z, 0) / trees.length;
+  return { trees, bridges, pads, minX, maxX, minZ, maxZ, cx, cz, name: 'Canopy City' };
+}
+
+const NATURAL = [STONE, DIRT, GRASS, SAND, SANDSTONE, BASALT, LEAF];
+function wid0(beam) { return beam * 0.55; }
+
+function applyCity(W, ch) {
+  const C = W.city; if (!C) return;
+  const x0 = ch.cx * CS, z0 = ch.cz * CS;
+  if (x0 + CS < C.minX || x0 > C.maxX || z0 + CS < C.minZ || z0 > C.maxZ) return;
+
+  const ts = [], bs = [], pd = [];
+  for (const t of C.trees)
+    if (x0 - t.reach < t.x && t.x < x0 + CS + t.reach && z0 - t.reach < t.z && t.z < z0 + CS + t.reach) ts.push(t);
+  for (const b of C.bridges)
+    if (!(x0 + CS < b.minX || x0 > b.maxX || z0 + CS < b.minZ || z0 > b.maxZ)) bs.push(b);
+  for (const p of C.pads)
+    if (Math.abs(p.x - (x0 + CS / 2)) < CS + 8 && Math.abs(p.z - (z0 + CS / 2)) < CS + 8) pd.push(p);
+  if (!ts.length && !bs.length && !pd.length) return;
+
+  const vox = ch.vox;
+  const R = W.rave;
+  const at = (lx, y, lz) => vox[lx + CS * (lz + CS * y)];
+  const put = (lx, y, lz, id, force) => {
+    if (y < 1 || y > MAXY) return;
+    // keep FOLIAGE out of the crater's airspace, but the spoke bridges and their
+    // landing pads deliberately reach the rim, so never block a forced placement
+    if (!force && R && y >= R.floorY && y <= R.floorY + 26) {
+      const wx = x0 + lx, wz = z0 + lz;
+      if ((wx - R.x) * (wx - R.x) + (wz - R.z) * (wz - R.z) < (R.rad + 1) * (R.rad + 1)) return;
+    }
+    const i = lx + CS * (lz + CS * y);
+    const cur = vox[i];
+    if (!force && cur !== AIR && cur !== WATER) return;
+    vox[i] = id;
+  };
+  // open headroom, but only through natural ground, never through built timber
+  const clr = (lx, y, lz) => {
+    if (y < 1 || y > MAXY) return;
+    const i = lx + CS * (lz + CS * y);
+    if (NATURAL.indexOf(vox[i]) >= 0) vox[i] = AIR;
+  };
+
+  for (let lz = 0; lz < CS; lz++) {
+    for (let lx = 0; lx < CS; lx++) {
+      const wx = x0 + lx, wz = z0 + lz;
+      for (let i = 0; i < ts.length; i++) treeColumn(ts[i], wx, wz, lx, lz, put, clr, at);
+      for (let i = 0; i < bs.length; i++) bridgeColumn(bs[i], wx, wz, lx, lz, put, clr);
+      for (let i = 0; i < pd.length; i++) padColumn(pd[i], wx, wz, lx, lz, put, clr);
+    }
+  }
+}
+
+function treeColumn(t, wx, wz, lx, lz, put, clr, at) {
+  const dx = wx - t.x, dz = wz - t.z;
+  const r = Math.hypot(dx, dz);
+  if (r > t.reach) return;
+  const span = t.top - t.base;
+  const th = Math.atan2(dz, dx);
+  const rAt = (y) => t.r0 + (t.r1 - t.r0) * clamp((y - t.base) / span, 0, 1);
+
+  // ---- tapered trunk ----
+  if (r <= t.r0 + 0.5) {
+    let yMax;
+    if (r <= t.r1) yMax = t.top;
+    else yMax = t.base + clamp((r - t.r0) / (t.r1 - t.r0), 0, 1) * span;
+    for (let y = t.base - 5; y <= Math.min(t.top, Math.floor(yMax)); y++) put(lx, y, lz, LOG, true);
+  }
+
+  // ---- buttress roots ----
+  if (r > t.r0 - 0.6 && r < t.r0 + 3.6) {
+    for (let k = 0; k < 5; k++) {
+      if (angDist(th, t.ang + k * (TAU / 5)) < 0.30) {
+        const hgt = Math.round(t.base + 5 * (1 - (r - t.r0) / 3.6));
+        for (let y = t.base - 5; y <= hgt; y++) put(lx, y, lz, LOG, true);
+        break;
+      }
+    }
+  }
+
+  // ---- spiral stair up to the first deck ----
+  const d0 = t.decks[0];
+  if (r > t.r0 + 0.2 && r < t.r0 + 2.9) {
+    const rise = 7;
+    const frac = (((th - t.ang) / TAU) % 1 + 1) % 1;
+    for (let y = t.base + 1 + frac * rise; y <= d0.y + 0.5; y += rise) {
+      const yy = Math.round(y);
+      if (yy > t.base && yy <= d0.y) {
+        put(lx, yy, lz, PLANK, true);
+        for (let c = 1; c <= 3; c++) clr(lx, yy + c, lz);
+        if (r > t.r0 + 2.2) put(lx, yy + 1, lz, LOG, true);
+      }
+    }
+  }
+
+  // ---- decks, railings, hanging lanterns ----
+  for (let k = 0; k < t.decks.length; k++) {
+    const dk = t.decks[k];
+    if (r <= dk.r) {
+      if (r > rAt(dk.y) - 0.3) put(lx, dk.y, lz, PLANK, true);
+      for (let c = 1; c <= 4; c++) clr(lx, dk.y + c, lz);
+    }
+    if (r > dk.r - 1.0 && r <= dk.r) {
+      let open = false;
+      for (let g = 0; g < dk.gaps.length; g++) if (angDist(th, dk.gaps[g]) < 0.26) open = true;
+      if (!open) {
+        const seg = Math.round(((th + Math.PI) / TAU) * dk.posts);
+        if (seg % 2 === 0) { put(lx, dk.y + 1, lz, LOG, true); put(lx, dk.y + 2, lz, LOG, true); }
+        else put(lx, dk.y + 2, lz, PLANK, true);
+      }
+      if (((wx * 5 + wz * 3) % 13) === 0) put(lx, dk.y - 2, lz, LANTERN, true);
+      // strung paper lanterns along the rail, and rope guy-lines dropping away
+      if (((wx * 7 + wz * 11) % 9) === 0) put(lx, dk.y + 3, lz, LANT_P, true);
+      if (((wx * 3 + wz * 5) % 17) === 0) {
+        for (let c = 1; c <= 3; c++) put(lx, dk.y - c, lz, ROPE, false);
+      }
+    }
+
+    // support struts fanning under each deck so it reads as engineered
+    if (r > t.r0 && r <= dk.r && ((Math.round(((th + Math.PI) / TAU) * 16)) % 2 === 0)) {
+      const drop = Math.round((r - t.r0) * 0.75);
+      if (drop >= 1 && drop <= 5) put(lx, dk.y - drop, lz, LOG, false);
+    }
+
+    // rope ladder climbing to the deck above, on the trunk's shaded side
+    if (k < t.decks.length - 1) {
+      const up = t.decks[k + 1];
+      const lad = t.ang + Math.PI * 0.5;
+      if (angDist(th, lad) < 0.10 && r > t.r0 + 0.2 && r < t.r0 + 1.6) {
+        for (let y = dk.y + 1; y <= up.y; y++) put(lx, y, lz, ROPE, false);
+      }
+    }
+
+    // market stalls ring the lowest deck: awning, counter, lantern
+    if (k === 0) {
+      const stalls = 5;
+      for (let sIdx = 0; sIdx < stalls; sIdx++) {
+        const sa = t.ang + 0.6 + sIdx * (TAU / stalls);
+        const sr = dk.r - 1.9;
+        const sxp = t.x + Math.cos(sa) * sr, szp = t.z + Math.sin(sa) * sr;
+        if (Math.abs(wx - sxp) <= 1 && Math.abs(wz - szp) <= 1) {
+          put(lx, dk.y + 1, lz, PLANK, true);                  // counter
+          put(lx, dk.y + 3, lz, AWNING, true);                 // canopy
+          if (Math.abs(wx - sxp) < 0.5 && Math.abs(wz - szp) < 0.5) put(lx, dk.y + 4, lz, LANT_P, true);
+        }
+      }
+    }
+  }
+
+  // ---- pods out on the limbs: little cabins hung in the branches ----
+  for (let k = 0; k < t.branches.length; k++) {
+    const br = t.branches[k];
+    if (k % 2) continue;
+    const px2 = t.x + Math.cos(br.a) * (br.len - 1.5);
+    const pz2 = t.z + Math.sin(br.a) * (br.len - 1.5);
+    const py2 = Math.round(br.y0 + br.rise * (br.len - 1.5));
+    const adx = wx - px2, adz = wz - pz2;
+    if (Math.abs(adx) > 2 || Math.abs(adz) > 2) continue;
+    const wall = Math.abs(adx) === 2 || Math.abs(adz) === 2;
+    put(lx, py2 + 1, lz, PLANK, true);
+    for (let c = 2; c <= 4; c++) {
+      if (wall) put(lx, py2 + c, lz, (c === 3 && (adx === 0 || adz === 0)) ? LITGLASS : PLANK, true);
+      else clr(lx, py2 + c, lz);
+    }
+    if (Math.abs(adx) <= 1 && Math.abs(adz) <= 1) put(lx, py2 + 5, lz, SHINGLE, true);
+    if (adx === 0 && adz === 0) put(lx, py2 + 2, lz, LANT_P, true);
+  }
+
+  // ---- huts: plank walls, glass windows, doorway, pitched thatch roof ----
+  for (let h = 0; h < t.huts.length; h++) {
+    const hut = t.huts[h];
+    const ax = wx - hut.x, az = wz - hut.z;
+    if (Math.abs(ax) > hut.w + 1 || Math.abs(az) > hut.d + 1) continue;
+    const inner = Math.abs(ax) <= hut.w && Math.abs(az) <= hut.d;
+    if (inner) {
+      put(lx, hut.y - 1, lz, PLANK, true);
+      const wall = Math.abs(ax) === hut.w || Math.abs(az) === hut.d;
+      const doorSide = Math.round(Math.cos(hut.a + Math.PI)) !== 0;
+      for (let c = 0; c < hut.h; c++) {
+        const y = hut.y + c;
+        if (!wall) { put(lx, y, lz, AIR, true); continue; }
+        const onDoor = doorSide
+          ? (ax === -Math.sign(Math.cos(hut.a)) * hut.w && az === 0)
+          : (az === -Math.sign(Math.sin(hut.a)) * hut.d && ax === 0);
+        if (onDoor && c < 2) { put(lx, y, lz, AIR, true); continue; }
+        const win = c === 1 && !onDoor &&
+          ((Math.abs(ax) === hut.w && Math.abs(az) === 1) || (Math.abs(az) === hut.d && Math.abs(ax) === 1));
+        put(lx, y, lz, win ? LITGLASS : PLANK, true);
+      }
+      if (ax === 0 && az === 0) put(lx, hut.y + hut.h - 1, lz, LANTERN, true);
+      // loft floor + upper window for the tall houses
+      if (hut.loft) {
+        const ly = hut.y + 3;
+        if (!(Math.abs(ax) === hut.w || Math.abs(az) === hut.d)) put(lx, ly, lz, PLANK, true);
+        else if (Math.abs(ax) === hut.w && az === 0) put(lx, ly + 1, lz, LITGLASS, true);
+      }
+    }
+    // shingled gable roof, overhanging one block, with a ridge beam
+    const ridge = hut.d + 1 - Math.abs(az);
+    if (ridge >= 0 && Math.abs(ax) <= hut.w + 1) {
+      const ry = hut.y + hut.h + Math.max(0, ridge - 1);
+      put(lx, ry, lz, az === 0 ? LOG : SHINGLE, true);
+      if (Math.abs(ax) === hut.w + 1 && ridge <= 1) put(lx, ry - 1, lz, SHINGLE, true);
+    }
+    // porch lantern beside the door, and a hanging banner
+    if (hut.lantern && Math.abs(ax) === hut.w + 1 && az === 0) put(lx, hut.y + 2, lz, LANT_P, true);
+    if (hut.banner && Math.abs(az) === hut.d + 1 && ax === 0) {
+      for (let c = 0; c < 3; c++) put(lx, hut.y + hut.h - 1 - c, lz, BANNER, false);
+    }
+  }
+
+  // ---- limbs ----
+  for (let k = 0; k < t.branches.length; k++) {
+    const br = t.branches[k];
+    const c = Math.cos(br.a), s = Math.sin(br.a);
+    const tt = dx * c + dz * s;
+    if (tt < 0 || tt > br.len) continue;
+    const pp = Math.abs(-dx * s + dz * c);
+    if (pp > 1.3) continue;
+    const y = Math.round(br.y0 + br.rise * tt);
+    put(lx, y, lz, LOG, true);
+    if (pp <= 0.7) put(lx, y - 1, lz, LOG, true);
+  }
+
+  // ---- canopy ----
+  for (let k = 0; k < t.canopy.length; k++) {
+    const sp = t.canopy[k];
+    const ddx = wx - sp.x, ddz = wz - sp.z;
+    const d2 = ddx * ddx + ddz * ddz;
+    if (d2 >= sp.r * sp.r) continue;
+    const hh = Math.sqrt(sp.r * sp.r - d2);
+    const ya = Math.ceil(sp.y - hh * 0.78), yb = Math.floor(sp.y + hh * 0.62);
+    const rad2 = sp.r * sp.r;
+    for (let y = ya; y <= yb; y++) {
+      // ragged only on the OUTER shell, a hollow-punched interior would explode
+      // the face count, since every interior hole exposes six more quads
+      const dy = (y - sp.y) * 1.35;
+      const q = (d2 + dy * dy) / rad2;
+      if (q > 0.52 && rnd2(wx * 7 + y, wz * 13, 4242) > 0.88) continue;
+      put(lx, y, lz, LEAF, false);
+    }
+  }
+  void at;
+}
+
+function bridgeColumn(b, wx, wz, lx, lz, put, clr) {
+  const abx = b.bx - b.ax, abz = b.bz - b.az;
+  const L2 = abx * abx + abz * abz;
+  if (L2 < 1) return;
+  const t = ((wx - b.ax) * abx + (wz - b.az) * abz) / L2;
+  if (t < 0 || t > 1) return;
+  const px = b.ax + abx * t, pz = b.az + abz * t;
+  const p = Math.hypot(wx - px, wz - pz);
+  if (p > 2.3) return;
+  const y = Math.round(b.ay + (b.by - b.ay) * t - b.sag * 4 * t * (1 - t));
+  if (p <= 1.4) {
+    put(lx, y, lz, PLANK, true);
+    for (let c = 1; c <= 3; c++) clr(lx, y + c, lz);
+  } else {
+    const along = Math.round(t * Math.sqrt(L2));
+    if (along % 4 === 0) { put(lx, y + 1, lz, LOG, true); put(lx, y + 2, lz, LOG, true); }
+    else put(lx, y + 2, lz, THATCH, true);
+  }
+}
+
+function padColumn(pd, wx, wz, lx, lz, put, clr) {
+  const dx = wx - pd.x, dz = wz - pd.z;
+  if (Math.abs(dx) > pd.r + 1 || Math.abs(dz) > pd.r + 1) return;
+  const d = Math.max(Math.abs(dx), Math.abs(dz));
+  if (d <= pd.r) {
+    put(lx, pd.y, lz, PLANK, true);
+    for (let c = 1; c <= 4; c++) clr(lx, pd.y + c, lz);
+    if (d === pd.r && ((wx + wz) & 1) === 0) put(lx, pd.y + 1, lz, LOG, true);
+    // steps down toward the crater
+    const inx = Math.round(Math.cos(pd.toward)), inz = Math.round(Math.sin(pd.toward));
+    if (inx !== 0 ? (Math.sign(dx) === inx && Math.abs(dz) <= 1) : (Math.sign(dz) === inz && Math.abs(dx) <= 1)) {
+      for (let k = 1; k <= 4; k++) put(lx, pd.y - k, lz, PLANK, true);
+    }
+  }
+}
+
+/* ==================== meshing ==================== */
+const NORMALS = [
+  { n: [1, 0, 0], u: [0, 0, -1], v: [0, 1, 0], shade: 0.80, face: 2 },
+  { n: [-1, 0, 0], u: [0, 0, 1], v: [0, 1, 0], shade: 0.74, face: 2 },
+  { n: [0, 1, 0], u: [1, 0, 0], v: [0, 0, -1], shade: 1.00, face: 0 },
+  { n: [0, -1, 0], u: [1, 0, 0], v: [0, 0, 1], shade: 0.52, face: 1 },
+  { n: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0], shade: 0.90, face: 2 },
+  { n: [0, 0, -1], u: [-1, 0, 0], v: [0, 1, 0], shade: 0.86, face: 2 }
+];
+const CORNERS = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+
+// flat-array offsets so the neighbourhood fetch is pointer arithmetic, not calls
+const OFF6 = new Int32Array(NORMALS.map((F) => F.n[0] + CS * F.n[2] + CS * CS * F.n[1]));
+const OFF27 = new Int32Array(27);
+{ let k = 0; for (let oy = -1; oy <= 1; oy++) for (let oz = -1; oz <= 1; oz++) for (let ox = -1; ox <= 1; ox++) OFF27[k++] = ox + CS * oz + CS * CS * oy; }
+
+const WARM = [1.03, 1.00, 0.93];
+const COOL = [0.55, 0.66, 0.94];
+
+function meshChunk(world, ch) {
+  const cx = ch.cx, cz = ch.cz, vox = ch.vox;
+  const out = {
+    1: { pos: [], uv: [], col: [], idx: [], lit: [], n: 0 },
+    2: { pos: [], uv: [], col: [], idx: [], lit: [], n: 0 },
+    3: { pos: [], uv: [], col: [], idx: [], wav: [], shore: [], n: 0 }
+  };
+
+  // 3x3 neighbourhood cache, keeps every string-keyed Map lookup out of the hot loop
+  const NV = new Array(9), NH = new Array(9);
+  const lights = [];
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const i = (dz + 1) * 3 + (dx + 1);
+      const c = world.chunks.get(world.key(cx + dx, cz + dz));
+      NV[i] = c ? c.vox : null;
+      NH[i] = c ? c.heights : null;
+      if (c && c.lights.length) for (const l of c.lights) { if (lights.length < 96) lights.push(l); }
+    }
+  }
+  const hasL = lights.length > 0;
+
+  const gv = (x, y, z) => {
+    if (y < 0) return BEDROCK;
+    if (y > MAXY) return AIR;
+    let ix = 1, iz = 1, lx = x, lz = z;
+    if (x < 0) { ix = 0; lx = x + CS; } else if (x >= CS) { ix = 2; lx = x - CS; }
+    if (z < 0) { iz = 0; lz = z + CS; } else if (z >= CS) { iz = 2; lz = z - CS; }
+    const v = NV[iz * 3 + ix];
+    return v ? v[lx + CS * (lz + CS * y)] : AIR;
+  };
+
+  // padded column-height field for the skylight term (pad 2 covers the AO reach)
+  const P = 2, PW = CS + 2 * P;
+  const ph = new Int16Array(PW * PW);
+  for (let z = -P; z < CS + P; z++) {
+    for (let x = -P; x < CS + P; x++) {
+      let ix = 1, iz = 1, lx = x, lz = z;
+      if (x < 0) { ix = 0; lx = x + CS; } else if (x >= CS) { ix = 2; lx = x - CS; }
+      if (z < 0) { iz = 0; lz = z + CS; } else if (z >= CS) { iz = 2; lz = z - CS; }
+      const h = NH[iz * 3 + ix];
+      ph[(z + P) * PW + (x + P)] = h ? h[lz * CS + lx] : SEA;
+    }
+  }
+  const skyAt = (x, y, z) => {
+    const o = (z + P) * PW + (x + P);
+    let t = ph[o];
+    let best = y > t ? 1 : 1 - (t - y) * 0.19;
+    const nb = [ph[o + 1], ph[o - 1], ph[o + PW], ph[o - PW]];
+    for (let i = 0; i < 4; i++) {
+      t = nb[i];
+      const v = (y > t ? 1 : 1 - (t - y) * 0.19) - 0.12;
+      if (v > best) best = v;
+    }
+    return best > 1 ? 1 : (best < 0 ? 0 : best);
+  };
+
+  const ao4 = [0, 0, 0, 0];
+  // Every AO sample for every face lies inside the voxel's own 3x3x3 shell
+  // (face normal + two orthogonal tangents, each +/-1). Read that shell once
+  // instead of re-querying up to 78 times per voxel, and bail after only the
+  // 6 direct neighbours when the voxel is fully enclosed, which is the common
+  // case inside a solid canopy.
+  const nb27 = new Uint8Array(27);
+  const N3 = (ox, oy, oz) => nb27[(oy + 1) * 9 + (oz + 1) * 3 + (ox + 1)];
+  const showFace = new Uint8Array(6);
+  const maxY = Math.min(MAXY, ch.maxY === undefined ? MAXY : ch.maxY);
+
+  const LU = ch.layerUsed;
+  for (let y = 0; y <= maxY; y++) {
+    if (LU && !LU[y]) continue;                    // nothing in this layer at all
+    for (let z = 0; z < CS; z++) {
+      for (let x = 0; x < CS; x++) {
+        const id = vox[x + CS * (z + CS * y)];
+        if (id === AIR) continue;
+        const pass = PASS_T[id];
+        if (!pass) continue;
+
+        const vi = x + CS * (z + CS * y);
+        const inner = x > 0 && x < CS - 1 && z > 0 && z < CS - 1 && y > 0 && y < MAXY;
+        let any = 0;
+        for (let f = 0; f < 6; f++) {
+          const F = NORMALS[f];
+          const nb = inner ? vox[vi + OFF6[f]] : gv(x + F.n[0], y + F.n[1], z + F.n[2]);
+          nb27[(F.n[1] + 1) * 9 + (F.n[2] + 1) * 3 + (F.n[0] + 1)] = nb;
+          let show;
+          if (pass === 3) show = (nb === AIR);
+          else if (pass === 2) show = (nb !== id && !isOpaque(nb));
+          else show = !isOpaque(nb);
+          showFace[f] = show ? 1 : 0;
+          any |= show ? 1 : 0;
+        }
+        if (!any) continue;                                  // fully enclosed: 6 reads, done
+
+        if (inner) {
+          for (let k = 0; k < 27; k++) nb27[k] = vox[vi + OFF27[k]];
+        } else {
+          for (let oy = -1; oy <= 1; oy++)
+            for (let oz = -1; oz <= 1; oz++)
+              for (let ox = -1; ox <= 1; ox++)
+                nb27[(oy + 1) * 9 + (oz + 1) * 3 + (ox + 1)] = gv(x + ox, y + oy, z + oz);
+        }
+
+        for (let f = 0; f < 6; f++) {
+          if (!showFace[f]) continue;
+          const F = NORMALS[f];
+          const ax = x + F.n[0], ay = y + F.n[1], az = z + F.n[2];
+
+          const uvq = UVT[TILE_T[id * 3 + (F.face === 2 ? 2 : F.face)]];
+          const g = out[pass];
+          const base = g.n;
+
+          const skyL = skyAt(ax, ay, az);
+          const glow = GLOW_T[id] ? 0.55 : 0;
+          let blockL = 0;
+          if (hasL) {
+            const wax = cx * CS + ax, waz = cz * CS + az;
+            for (let i = 0; i < lights.length; i++) {
+              const l = lights[i];
+              const d = Math.abs(l[0] - wax) + Math.abs(l[1] - ay) + Math.abs(l[2] - waz);
+              if (d < 11) { const v = 1 - d / 11; if (v > blockL) blockL = v; }
+            }
+          }
+          // depth attenuation below the waterline
+          const dep = ay < SEA ? clamp(1 - (SEA - ay) * 0.045, 0.36, 1) : 1;
+          const lightTerm = clamp(0.20 + 0.80 * skyL + blockL * 0.95, 0, 1.15) * dep;
+
+          const u0 = F.u[0], u1 = F.u[1], u2 = F.u[2];
+          const v0 = F.v[0], v1 = F.v[1], v2 = F.v[2];
+          // shoreline: how much solid ground touches this water surface, per corner
+          const isTop = pass === 3 && f === 2;
+
+          for (let k = 0; k < 4; k++) {
+            const a = CORNERS[k][0], b = CORNERS[k][1];
+            const s1 = isOpaque(N3(F.n[0] + u0 * a, F.n[1] + u1 * a, F.n[2] + u2 * a)) ? 1 : 0;
+            const s2 = isOpaque(N3(F.n[0] + v0 * b, F.n[1] + v1 * b, F.n[2] + v2 * b)) ? 1 : 0;
+            const co = isOpaque(N3(F.n[0] + u0 * a + v0 * b, F.n[1] + u1 * a + v1 * b, F.n[2] + u2 * a + v2 * b)) ? 1 : 0;
+            const ao = (s1 && s2) ? 0 : (3 - (s1 + s2 + co));
+            ao4[k] = 0.46 + 0.54 * (ao / 3);
+
+            g.pos.push(
+              x + 0.5 + 0.5 * F.n[0] + 0.5 * (u0 * a + v0 * b),
+              y + 0.5 + 0.5 * F.n[1] + 0.5 * (u1 * a + v1 * b),
+              z + 0.5 + 0.5 * F.n[2] + 0.5 * (u2 * a + v2 * b)
+            );
+            g.uv.push(uvq.u0 + (a > 0 ? uvq.du : 0), uvq.v0 + (b > 0 ? uvq.dv : 0));
+            if (pass === 3) {
+              g.wav.push(f === 2 ? 1 : 0);
+              let sh = 0;
+              if (isTop) {
+                // ground at the same level beside this corner, or one below it (a shelf)
+                const e1 = N3(u0 * a, 0, u2 * a), e2 = N3(v0 * b, 0, v2 * b), e3 = N3(u0 * a + v0 * b, 0, u2 * a + v2 * b);
+                const solidSide = (isOpaque(e1) ? 1 : 0) + (isOpaque(e2) ? 1 : 0) + (isOpaque(e3) ? 1 : 0);
+                const below = N3(u0 * a + v0 * b, -1, u2 * a + v2 * b);
+                // beside a bank: real breaking foam; over a shelf one block down: a faint lace only
+                sh = solidSide ? Math.min(1, 0.40 + 0.20 * solidSide) : (isOpaque(below) ? 0.14 : 0);
+              }
+              g.shore.push(sh);
+            } else {
+              g.lit.push(f, skyL);
+            }
+
+            let t = F.shade * ao4[k] * lightTerm + glow;
+            if (t > 1.25) t = 1.25; else if (t < 0) t = 0;
+            const m = t > 1 ? 1 : t;
+            g.col.push(
+              (COOL[0] + (WARM[0] - COOL[0]) * m) * t,
+              (COOL[1] + (WARM[1] - COOL[1]) * m) * t,
+              (COOL[2] + (WARM[2] - COOL[2]) * m) * t
+            );
+          }
+          // flip the quad diagonal on the dark corner so AO does not crease wrongly
+          if (ao4[0] + ao4[2] > ao4[1] + ao4[3])
+            g.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+          else
+            g.idx.push(base + 1, base + 2, base + 3, base + 1, base + 3, base);
+          g.n += 4;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/* ==================== renderer / scene ==================== */
+const canvas = $('c');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+} catch (e) {
+  fault('WebGL unavailable', 'This browser could not create a WebGL context.\n' + e.message);
+  throw e;
+}
+if (!renderer.capabilities.isWebGL2) {
+  fault('WebGL2 required', 'Your browser reports WebGL1 only. Update the browser or enable hardware acceleration.');
+}
+/* Resolution scaling. dprScale is the adaptive term: Auto quality nudges it
+   down when frames run long and back up when there is headroom, so the world
+   holds its frame time on whatever GPU it lands on. */
+let dprScale = 1;
+const dprCap = () => Math.min(window.devicePixelRatio || 1, Q.dprCap);
+const effectiveDPR = () => Math.max(0.5, dprCap() * dprScale);
+renderer.setPixelRatio(effectiveDPR());
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;
+
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  fault('Graphics context lost', 'The GPU dropped the WebGL context (often low VRAM or a background tab). Reload the page to recover.');
+});
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.08, 900);
+const fog = new THREE.Fog(0x9fc7dd, 40, 260);
+scene.fog = fog;
+
+const { tex: atlasTex, canvas: atlasCanvas } = buildAtlas();
+
+const matOpaque = new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, fog: true });
+const matCutout = new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, fog: true, alphaTest: 0.5, side: THREE.FrontSide });
+
+/* Directional sun on top of the baked lighting. The bake carries AO, skylight
+   and depth; this adds the part that has to move: faces turned toward the sun
+   brighten, faces turned away fall back to the bake, and the whole term fades
+   out as the sun sets so night is carried by the tint alone. The face normal is
+   reconstructed from a per-vertex face index; skylight gates it so cave walls
+   and building interiors never catch sun. */
+const sunShade = { uniforms: { uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunStr: { value: 1 } }, shaders: [] };
+function injectSun(shader) {
+  shader.uniforms.uSunDir = sunShade.uniforms.uSunDir;
+  shader.uniforms.uSunStr = sunShade.uniforms.uSunStr;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', `#include <common>
+      attribute vec2 aLit; uniform vec3 uSunDir; uniform float uSunStr; varying float vSun;`)
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+      {
+        int fi = int(aLit.x + 0.5);
+        vec3 fn = fi == 0 ? vec3(1.,0.,0.) : fi == 1 ? vec3(-1.,0.,0.) : fi == 2 ? vec3(0.,1.,0.)
+                : fi == 3 ? vec3(0.,-1.,0.) : fi == 4 ? vec3(0.,0.,1.) : vec3(0.,0.,-1.);
+        float sunTerm = max(dot(fn, uSunDir), 0.0);
+        // wrap a little so the terminator is soft on a blocky world
+        sunTerm = smoothstep(-0.15, 1.0, sunTerm);
+        // the bake already peaks near 1.18 on lit tops, so the sun term is a
+        // modest swing around unity rather than a second multiplier on top
+        vSun = mix(1.0, 0.80 + 0.26 * sunTerm, aLit.y * uSunStr);
+      }`);
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\n varying float vSun;')
+    .replace('#include <color_fragment>', '#include <color_fragment>\n diffuseColor.rgb *= vSun;');
+  sunShade.shaders.push(shader);
+}
+matOpaque.onBeforeCompile = injectSun;
+matCutout.onBeforeCompile = injectSun;
+matOpaque.customProgramCacheKey = () => 'atoll-sun';
+matCutout.customProgramCacheKey = () => 'atoll-sun-cut';
+
+const waterUniforms = THREE.UniformsUtils.merge([
+  THREE.UniformsLib.fog,
+  { uTime: { value: 0 }, uSun: { value: new THREE.Vector3(0.4, 0.8, 0.3) }, uTint: { value: new THREE.Color(1, 1, 1) }, uMap: { value: null } }
+]);
+waterUniforms.uMap.value = atlasTex;
+
+const matWater = new THREE.ShaderMaterial({
+  uniforms: waterUniforms,
+  fog: true,
+  transparent: true,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+  vertexShader: `
+    #include <common>
+    #include <fog_pars_vertex>
+    attribute vec3 vcol;
+    attribute float wav;
+    attribute float shore;
+    uniform float uTime;
+    varying vec2 vUv; varying vec3 vCol; varying vec3 vWPos; varying float vWav; varying float vShore;
+    void main(){
+      vUv = uv; vCol = vcol; vWav = wav; vShore = shore;
+      vec3 p = position;
+      vec3 wp = (modelMatrix * vec4(position,1.0)).xyz;
+      if (wav > 0.5) {
+        float w = sin(wp.x*0.55 + uTime*1.7)*0.055
+                + sin(wp.z*0.42 - uTime*1.3)*0.050
+                + sin((wp.x+wp.z)*0.23 + uTime*0.8)*0.035;
+        p.y += w - 0.10; wp.y += w - 0.10;
+      }
+      vWPos = wp;
+      vec4 mvPosition = modelViewMatrix * vec4(p,1.0);
+      gl_Position = projectionMatrix * mvPosition;
+      #include <fog_vertex>
+    }`,
+  fragmentShader: `
+    #include <common>
+    #include <fog_pars_fragment>
+    uniform sampler2D uMap; uniform vec3 uTint; uniform float uTime; uniform vec3 uSun;
+    varying vec2 vUv; varying vec3 vCol; varying vec3 vWPos; varying float vWav; varying float vShore;
+    float hash21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float vnoise(vec2 p){
+      vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+      return mix(mix(hash21(i), hash21(i+vec2(1,0)), f.x), mix(hash21(i+vec2(0,1)), hash21(i+vec2(1,1)), f.x), f.y);
+    }
+    void main(){
+      vec4 texel = texture2D(uMap, vUv);
+      vec3 base = pow(texel.rgb, vec3(2.2)) * vCol * uTint;
+      vec3 n = vec3(0.0,1.0,0.0);
+      if (vWav > 0.5) {
+        float dx = cos(vWPos.x*0.55 + uTime*1.7)*0.030
+                 + cos((vWPos.x+vWPos.z)*0.23 + uTime*0.8)*0.008;
+        float dz = -cos(vWPos.z*0.42 - uTime*1.3)*0.021
+                 + cos((vWPos.x+vWPos.z)*0.23 + uTime*0.8)*0.008;
+        n = normalize(vec3(-dx, 1.0, -dz));
+      }
+      vec3 V = normalize(cameraPosition - vWPos);
+      float fres = pow(1.0 - clamp(dot(n,V),0.0,1.0), 4.0);
+      vec3 H = normalize(normalize(uSun) + V);
+      float spec = pow(max(dot(n,H),0.0), 96.0);
+      vec3 col = base + fres*0.22*uTint + spec*1.1*uTint*vWav;
+      float alpha = 0.78 + fres*0.16;
+      // shoreline foam: breaking lines that surge in and drain back, plus a
+      // lacy residue, all keyed to how much ground touches this water
+      if (vShore > 0.01 && vWav > 0.5) {
+        float surge = 0.5 + 0.5 * sin(uTime * 1.35 + vWPos.x * 0.31 + vWPos.z * 0.27 + vnoise(vWPos.xz * 0.35) * 4.0);
+        float lace = vnoise(vWPos.xz * 1.7 + vec2(uTime * 0.35, -uTime * 0.22));
+        float lace2 = vnoise(vWPos.xz * 3.9 - vec2(uTime * 0.5, uTime * 0.3));
+        float foam = vShore * smoothstep(0.48, 0.98, lace * 0.6 + lace2 * 0.4 + surge * 0.42) * (0.55 + 0.45 * surge);
+        col = mix(col, vec3(0.92, 0.97, 1.0) * uTint, clamp(foam * 0.8, 0.0, 0.7));
+        alpha = mix(alpha, 0.92, clamp(foam, 0.0, 1.0));
+      }
+      gl_FragColor = vec4(col, alpha);
+      #include <fog_fragment>
+      #include <colorspace_fragment>
+    }`
+});
+
+/* ---- sky dome ---- */
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: {
+    uTop: { value: new THREE.Color(0x2f6ea8) },
+    uHor: { value: new THREE.Color(0xbfe0ee) },
+    uSun: { value: new THREE.Vector3(0.4, 0.7, 0.3) },
+    uSunCol: { value: new THREE.Color(0xfff0c8) },
+    uNight: { value: 0 },
+    uTime: { value: 0 }
+  },
+  vertexShader: `varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: `
+    uniform vec3 uTop; uniform vec3 uHor; uniform vec3 uSun; uniform vec3 uSunCol; uniform float uNight; uniform float uTime;
+    varying vec3 vD;
+    float hash13(vec3 p){ p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }
+    float hash31(vec3 p){ return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
+    void main(){
+      vec3 D = normalize(vD);
+      float t = clamp(D.y*1.05 + 0.05, 0.0, 1.0);
+      vec3 col = mix(uHor, uTop, pow(t, 0.62));
+      vec3 sd = normalize(uSun);
+      float d = max(dot(D, sd), 0.0);
+      col += uSunCol * pow(d, 220.0) * 2.4;
+      col += uSunCol * pow(d, 7.0) * 0.30;
+
+      if (uNight > 0.001 && D.y > -0.05) {
+        // stars: one candidate per cell of a direction grid, most cells empty,
+        // brightness from a second hash, a slow twinkle from a third
+        vec3 g = D * 110.0;
+        vec3 cell = floor(g);
+        float h = hash13(cell);
+        float star = 0.0;
+        if (h > 0.965) {
+          vec3 c = cell + 0.5 + (vec3(hash31(cell + 1.7), hash31(cell + 3.1), hash31(cell + 5.3)) - 0.5) * 0.6;
+          float r = length(g - c);
+          float mag = 0.35 + 0.65 * hash31(cell + 9.1);
+          float tw = 0.75 + 0.25 * sin(uTime * (1.5 + 2.0 * hash31(cell + 2.2)) + hash31(cell) * 6.28);
+          star = (1.0 - smoothstep(0.0, 0.55, r)) * mag * tw;
+        }
+        // milky way: a soft band across the sky
+        vec3 bandAxis = normalize(vec3(0.6, 0.35, -0.7));
+        float band = pow(1.0 - abs(dot(D, bandAxis)), 14.0);
+        float grain = hash31(floor(D * 40.0)) * 0.6 + 0.4;
+        float horizonFade = smoothstep(0.0, 0.25, D.y);
+        vec3 starCol = mix(vec3(0.75, 0.85, 1.0), vec3(1.0, 0.92, 0.8), hash31(cell + 4.4));
+        col += (star * 1.3 * starCol + band * grain * vec3(0.035, 0.042, 0.065)) * uNight * horizonFade;
+
+        // moon: opposite the sun, a lit disc with a soft halo
+        vec3 md = normalize(-sd);
+        float m = max(dot(D, md), 0.0);
+        float disc = smoothstep(0.9990, 0.9994, m);
+        float halo = pow(m, 60.0) * 0.35 + pow(m, 600.0) * 0.6;
+        col += (disc * vec3(0.95, 0.97, 1.0) * 1.4 + halo * vec3(0.55, 0.65, 0.85)) * uNight * smoothstep(-0.1, 0.1, md.y);
+      }
+      float dith = fract(sin(dot(vD.xy, vec2(12.9898,78.233))) * 43758.5453) * 0.0035;
+      gl_FragColor = vec4(col + dith, 1.0);
+      #include <colorspace_fragment>
+    }`
+});
+const skyDome = new THREE.Mesh(new THREE.SphereGeometry(600, 24, 16), skyMat);
+skyDome.frustumCulled = false;
+scene.add(skyDome);
+
+/* ---- clouds ---- */
+function cloudTexture() {
+  const S = 256, cv = document.createElement('canvas'); cv.width = cv.height = S;
+  const ctx = cv.getContext('2d'); const img = ctx.createImageData(S, S);
+  const nz = makeNoise(1337);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    let v = nz.fbm2(x * 0.018, y * 0.018, 5) * 0.5 + 0.5;
+    v = smoothstep(0.55, 0.80, v);
+    const i = (y * S + x) * 4;
+    img.data[i] = 255; img.data[i + 1] = 255; img.data[i + 2] = 255;
+    img.data[i + 3] = (v * 205) | 0;
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(cv);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(5, 5);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const cloudMat = new THREE.MeshBasicMaterial({ map: cloudTexture(), transparent: true, depthWrite: false, fog: false, opacity: 0.75, side: THREE.DoubleSide });
+const clouds = new THREE.Mesh(new THREE.PlaneGeometry(1600, 1600), cloudMat);
+clouds.rotation.x = -Math.PI / 2; clouds.position.y = 132; clouds.frustumCulled = false;
+scene.add(clouds);
+// a thin cirrus sheet above the Aerie so the sky is never empty from the top
+const cirrusTex = cloudTexture(); cirrusTex.repeat.set(2.2, 2.2);
+const cirrusMat = new THREE.MeshBasicMaterial({ map: cirrusTex, transparent: true, depthWrite: false, fog: false, opacity: 0.32, side: THREE.DoubleSide });
+const cirrus = new THREE.Mesh(new THREE.PlaneGeometry(2400, 2400), cirrusMat);
+cirrus.rotation.x = -Math.PI / 2; cirrus.position.y = 330; cirrus.frustumCulled = false;
+scene.add(cirrus);
+
+/* ---- selection box ---- */
+const selBox = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(1.004, 1.004, 1.004)),
+  new THREE.LineBasicMaterial({ color: 0x0b0f14, transparent: true, opacity: 0.85, fog: false })
+);
+selBox.visible = false; scene.add(selBox);
+
+/* ==================== chunk manager ==================== */
+const chunkRoot = new THREE.Group();
+scene.add(chunkRoot);
+
+let seed = (Math.random() * 0xffffffff) >>> 0;
+if (HASHP.get('seed')) seed = (parseInt(HASHP.get('seed'), 10) >>> 0) || seed;
+let world = new World(seed);
+
+let renderDist = Number.isFinite(settings.renderDist) && settings.renderDist ? clamp(settings.renderDist, 3, 12) : Q.rd;
+let rdEff = renderDist;          // render distance in use: grows with altitude so the view down from the Aerie is real terrain, not haze
+const built = new Map();     // key -> {meshes:[]}
+const genQueue = [];
+const meshQueue = [];
+
+function disposeChunkMeshes(k) {
+  const rec = built.get(k);
+  if (!rec) return;
+  for (const m of rec.meshes) { chunkRoot.remove(m); m.geometry.dispose(); }
+  built.delete(k);
+}
+
+function buildGeometry(g, pass) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(g.pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(g.uv, 2));
+  if (pass === 3) {
+    geo.setAttribute('vcol', new THREE.Float32BufferAttribute(g.col, 3));
+    geo.setAttribute('wav', new THREE.Float32BufferAttribute(g.wav, 1));
+    geo.setAttribute('shore', new THREE.Float32BufferAttribute(g.shore, 1));
+  } else {
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(g.col, 3));
+    geo.setAttribute('aLit', new THREE.Float32BufferAttribute(g.lit, 2));
+  }
+  geo.setIndex(g.idx);
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+function rebuild(ch) {
+  const k = world.key(ch.cx, ch.cz);
+  disposeChunkMeshes(k);
+  const out = meshChunk(world, ch);
+  const meshes = [];
+  for (const pass of [1, 2, 3]) {
+    const g = out[pass];
+    if (!g.n) continue;
+    const mat = pass === 1 ? matOpaque : pass === 2 ? matCutout : matWater;
+    const m = new THREE.Mesh(buildGeometry(g, pass), mat);
+    m.position.set(ch.cx * CS, 0, ch.cz * CS);
+    m.renderOrder = pass === 3 ? 2 : 0;
+    m.matrixAutoUpdate = false; m.updateMatrix();
+    chunkRoot.add(m); meshes.push(m);
+  }
+  built.set(k, { meshes });
+  ch.dirty = false;
+}
+
+function updateChunks(px, pz) {
+  const pcx = Math.floor(px / CS), pcz = Math.floor(pz / CS);
+  genQueue.length = 0; meshQueue.length = 0;
+  const rd = rdEff;
+
+  for (let dz = -rd - 1; dz <= rd + 1; dz++) {
+    for (let dx = -rd - 1; dx <= rd + 1; dx++) {
+      const d = Math.hypot(dx, dz);
+      if (d > rd + 1.5) continue;
+      const cx = pcx + dx, cz = pcz + dz;
+      const k = world.key(cx, cz);
+      if (!world.chunks.has(k)) genQueue.push([d, cx, cz]);
+      else if (d <= rd + 0.5 && (!built.has(k) || world.chunks.get(k).dirty)) meshQueue.push([d, cx, cz]);
+    }
+  }
+  genQueue.sort((a, b) => a[0] - b[0]);
+  meshQueue.sort((a, b) => a[0] - b[0]);
+
+  // unload by *data* residency, not mesh residency, otherwise generated-but-
+  // never-meshed border chunks accumulate forever as the player travels
+  for (const k of Array.from(world.chunks.keys())) {
+    const q = k.split(','); const ccx = +q[0], ccz = +q[1];
+    if (Math.hypot(ccx - pcx, ccz - pcz) > rd + 3) {
+      disposeChunkMeshes(k);
+      world.chunks.delete(k);
+    }
+  }
+}
+
+// Generation and meshing are INTERLEAVED. Draining generation first starves
+// meshing whenever the queue is long (e.g. right after a reseed) and the world
+// stays invisible until every chunk exists, terrain must appear progressively.
+function pumpQueues(budgetMs) {
+  const t0 = performance.now();
+  while (performance.now() - t0 < budgetMs) {
+    let did = false;
+    if (genQueue.length) {
+      const [, cx, cz] = genQueue.shift();
+      world.ensure(cx, cz);
+      did = true;
+    }
+    if (performance.now() - t0 >= budgetMs) break;
+    if (meshQueue.length) {
+      const [, cx, cz] = meshQueue.shift();
+      // neighbours must hold data so border faces cull correctly
+      world.ensure(cx - 1, cz); world.ensure(cx + 1, cz);
+      world.ensure(cx, cz - 1); world.ensure(cx, cz + 1);
+      rebuild(world.ensure(cx, cz));
+      did = true;
+    }
+    if (!did) break;
+  }
+}
+
+// Repeatedly re-scan + pump so newly generated chunks become mesh candidates
+// within the same warm-up rather than waiting a frame each.
+function warmup(totalMs) {
+  const t0 = performance.now();
+  let guard = 0;
+  while (performance.now() - t0 < totalMs && guard++ < 400) {
+    updateChunks(player.pos.x, player.pos.z);
+    if (!genQueue.length && !meshQueue.length) break;
+    pumpQueues(24);
+  }
+}
+
+/* ==================== player ==================== */
+const player = {
+  pos: new THREE.Vector3(0, SEA + 24, 0),
+  vel: new THREE.Vector3(),
+  yaw: 0, pitch: 0,
+  onGround: false, fly: false, inWater: false, sprint: false,
+  glide: false, airTime: 0, roll: 0, glideT: 0,
+  W: 0.62, H: 1.78, EYE: 1.62
+};
+
+let spawnHouse = null;
+
+/* Spawn on the Aerie: standing on the glass deck between the elevator
+   headhouse and the prow, looking out along the prow at the archipelago. */
+function spawn() {
+  const A = world.aerie;
+  if (A) {
+    const sx = Math.floor(A.spawn.x), sz = Math.floor(A.spawn.z);
+    world.ensure(sx >> 4, sz >> 4);
+    // the deck is generated, but verify before trusting the formula
+    let y = A.y + 1;
+    if (!isSolid(world.get(sx, A.y, sz))) world.set(sx, A.y, sz, PLANK);
+    while (y < MAXY - 2 && (isSolid(world.get(sx, y, sz)) || isSolid(world.get(sx, y + 1, sz)))) y++;
+    player.pos.set(sx + 0.5, y + 0.05, sz + 0.5);
+    player.yaw = A.spawn.yaw; player.pitch = A.spawn.pitch;
+    player.fly = false; player.glide = false; player.vel.set(0, 0, 0);
+    return;
+  }
+  spawnCity();
+}
+
+/* Guarantee the starting house actually opens onto its deck. Procedural walls
+   and railings can conspire to seal a doorway; rather than hope, cut the
+   opening and a short landing every time. */
+function carveDoorway(hut, dx, dz) {
+  const sx = dx || 0, sz = dz || 0;
+  const wallX = hut.x + sx * hut.w, wallZ = hut.z + sz * hut.d;
+  // start one cell INSIDE the room: later passes (stalls, struts, pods, ladders)
+  // can drop blocks into the interior after the house is stamped
+  for (let step = -(sx ? hut.w : hut.d); step <= 3; step++) {
+    const x = wallX + sx * step, z = wallZ + sz * step;
+    world.ensure(x >> 4, z >> 4);
+    for (let c = 0; c < 2; c++) {
+      if (isSolid(world.get(x, hut.y + c, z))) world.set(x, hut.y + c, z, AIR);
+    }
+    // make sure there is something to walk out onto
+    if (!isSolid(world.get(x, hut.y - 1, z))) world.set(x, hut.y - 1, z, PLANK);
+  }
+  // a porch lantern so the exit is obvious at night
+  const px2 = wallX + sx * 2 + (sz ? 1 : 0), pz2 = wallZ + sz * 2 + (sx ? 1 : 0);
+  if (world.get(px2, hut.y + 1, pz2) === AIR) world.set(px2, hut.y + 1, pz2, LANT_P);
+}
+
+function spawnCity() {
+  // Fallback opening: you wake up inside a house in the sky city. The door is
+  // the first thing you see, the descent to the portal is the first thing you do.
+  const C = world.city;
+  if (C && C.trees.length) {
+    const pick = C.trees[(rnd2(world.seed, 7, 4241) * C.trees.length) | 0] || C.trees[0];
+    world.ensure(pick.x >> 4, pick.z >> 4);
+    // prefer a house on an upper deck so the view of the sea is immediate
+    const huts = pick.huts.slice().sort((a, b) => b.y - a.y);
+    for (const hut of huts) {
+      world.ensure(hut.x >> 4, hut.z >> 4);
+      // stand on the hut floor, one step back from the doorway
+      const dirX = -Math.sign(Math.cos(hut.a)) || 0;
+      const dirZ = -Math.sign(Math.sin(hut.a)) || 0;
+      const doorSide = Math.round(Math.cos(hut.a + Math.PI)) !== 0;
+      const dx = doorSide ? dirX : 0, dz = doorSide ? 0 : dirZ;
+      const fx2 = hut.x, fz2 = hut.z;                     // hut centre
+      if (isSolid(world.get(fx2, hut.y - 1, fz2)) &&
+          !isSolid(world.get(fx2, hut.y, fz2)) &&
+          !isSolid(world.get(fx2, hut.y + 1, fz2))) {
+        player.pos.set(fx2 + 0.5, hut.y + 0.05, fz2 + 0.5);
+        player.yaw = faceYaw(0, 0, dx, dz);               // look at the door
+        player.pitch = 0.02;
+        spawnHouse = { hut, tree: pick, dx, dz };
+        carveDoorway(hut, dx, dz);
+        return;
+      }
+    }
+    // fall back to the top deck if no house was habitable
+    const dk = pick.decks[pick.decks.length - 1];
+    for (let rr = pick.r1 + 1.5; rr < dk.r; rr += 0.75) {
+      for (let a = 0; a < 12; a++) {
+        const ang = pick.ang + Math.PI + a * (TAU / 12);
+        const x = Math.round(pick.x + Math.cos(ang) * rr);
+        const z = Math.round(pick.z + Math.sin(ang) * rr);
+        world.ensure(x >> 4, z >> 4);
+        if (isSolid(world.get(x, dk.y, z)) && !isSolid(world.get(x, dk.y + 1, z)) &&
+            !isSolid(world.get(x, dk.y + 2, z))) {
+          player.pos.set(x + 0.5, dk.y + 1.05, z + 0.5);
+          const P = world.portal;
+          if (P) player.yaw = faceYaw(x, z, P.x, P.z);
+          player.pitch = -0.15;
+          return;
+        }
+      }
+    }
+  }
+  // walk outward from origin until we find dry land above the tideline
+  for (let r = 0; r < 900; r += 4) {
+    for (let a = 0; a < 12; a++) {
+      const ang = a * Math.PI / 6 + r * 0.11;
+      const x = Math.round(Math.cos(ang) * r), z = Math.round(Math.sin(ang) * r);
+      const c = world.column(x, z);
+      if (c.h > SEA + 2.5 && c.h < SEA + 14) {
+        world.ensure(x >> 4, z >> 4);
+        let y = Math.floor(c.h) + 1;
+        while (y < MAXY && isSolid(world.get(x, y, z))) y++;
+        player.pos.set(x + 0.5, y + 0.2, z + 0.5);
+        return;
+      }
+    }
+  }
+  player.pos.set(0.5, SEA + 12, 0.5);
+}
+
+function blockAABB(x, y, z) { return isSolid(world.get(x, y, z)); }
+
+function collide(axis, amount) {
+  const p = player.pos, hw = player.W / 2;
+  p[axis] += amount;
+  const minX = Math.floor(p.x - hw), maxX = Math.floor(p.x + hw);
+  const minY = Math.floor(p.y), maxY = Math.floor(p.y + player.H);
+  const minZ = Math.floor(p.z - hw), maxZ = Math.floor(p.z + hw);
+  for (let y = minY; y <= maxY; y++) {
+    for (let z = minZ; z <= maxZ; z++) {
+      for (let x = minX; x <= maxX; x++) {
+        if (!blockAABB(x, y, z)) continue;
+        if (axis === 'x') { p.x = amount > 0 ? x - hw - 1e-3 : x + 1 + hw + 1e-3; player.vel.x = 0; }
+        else if (axis === 'z') { p.z = amount > 0 ? z - hw - 1e-3 : z + 1 + hw + 1e-3; player.vel.z = 0; }
+        else {
+          if (amount > 0) { p.y = y - player.H - 1e-3; player.vel.y = 0; }
+          else { p.y = y + 1 + 1e-3; player.vel.y = 0; player.onGround = true; }
+        }
+        return;
+      }
+    }
+  }
+}
+
+// Does the player's box overlap anything solid at this position?
+function boxSolid(px, py, pz) {
+  const hw = player.W / 2;
+  const x0 = Math.floor(px - hw), x1 = Math.floor(px + hw);
+  const y0 = Math.floor(py), y1 = Math.floor(py + player.H);
+  const z0 = Math.floor(pz - hw), z1 = Math.floor(pz + hw);
+  for (let y = y0; y <= y1; y++)
+    for (let z = z0; z <= z1; z++)
+      for (let x = x0; x <= x1; x++)
+        if (isSolid(world.get(x, y, z))) return true;
+  return false;
+}
+
+// Horizontal move with automatic step-up. Without this every stair tread,
+// crater terrace and beach ledge demands a jump, the spiral stairs up the
+// greatwoods are unusable. Lifts at most one block, never while airborne.
+function moveH(axis, amount, grounded) {
+  if (amount === 0) return;
+  const p = player.pos;
+  const start = p[axis], startY = p.y;
+  collide(axis, amount);
+  if (Math.abs(p[axis] - (start + amount)) < 1e-6) return;   // moved freely
+  if (!grounded || player.fly) return;                        // only step while walking
+  const blocked = p[axis];
+  for (let li = 0; li < 2; li++) {
+    const lift = li === 0 ? 0.6 : 1.02;
+    p[axis] = start;
+    if (boxSolid(p.x, startY + lift, p.z)) continue;
+    p.y = startY + lift;
+    collide(axis, amount);
+    if (Math.abs(p[axis] - (start + amount)) < 1e-6 && !boxSolid(p.x, p.y, p.z)) {
+      player.onGround = true;
+      return;                                                 // stepped up cleanly
+    }
+  }
+  p.y = startY; p[axis] = blocked;                            // no room, stay blocked
+}
+
+const keys = Object.create(null);
+const touchMove = { x: 0, y: 0, active: false, id: -1, ox: 0, oy: 0 };
+
+function updatePlayer(dt) {
+  const eyeY = player.pos.y + player.EYE;
+  player.inWater = world.get(Math.floor(player.pos.x), Math.floor(eyeY - 0.9), Math.floor(player.pos.z)) === WATER;
+  const headWater = world.get(Math.floor(player.pos.x), Math.floor(eyeY), Math.floor(player.pos.z)) === WATER;
+
+  let fwd = 0, str = 0;
+  if (keys['KeyW'] || keys['ArrowUp']) fwd += 1;
+  if (keys['KeyS'] || keys['ArrowDown']) fwd -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) str += 1;
+  if (keys['KeyA'] || keys['ArrowLeft']) str -= 1;
+  if (touchMove.active) { fwd += -touchMove.y; str += touchMove.x; }
+  const mag = Math.hypot(fwd, str);
+  if (mag > 1) { fwd /= mag; str /= mag; }
+
+  player.sprint = !!keys['ShiftLeft'] || !!keys['ShiftRight'] || !!keys['__sprint'];
+  const base = player.fly ? 13 : (player.inWater ? 4.2 : 5.0);
+  const speed = base * (player.sprint ? 1.65 : 1);
+
+  const sy = Math.sin(player.yaw), cy = Math.cos(player.yaw);
+  let wishX = (-sy * fwd + cy * str) * speed;
+  let wishZ = (-cy * fwd - sy * str) * speed;
+
+  // the glider can only stay open in the air; water, ground and flight all close it
+  if (player.glide && (player.onGround || player.inWater || player.fly)) { player.glide = false; toast('Glider stowed'); }
+  player.airTime = (player.onGround || player.inWater || player.fly) ? 0 : player.airTime + dt;
+  if (player.airTime === 0) player.wantGlide = false;
+  else if (player.wantGlide && !player.glide && player.airTime > 0.25) openGlider();
+
+  let accel = player.onGround ? 14 : 5;
+  if (player.glide) {
+    // wing loading: the glider carries you forward along your look direction;
+    // the stick only trims sideways. Pitch trades altitude for speed.
+    const dive = clamp(-player.pitch, -0.6, 1.2);
+    const gs = 11.5 + Math.max(0, dive) * 9.0;
+    wishX = -sy * gs + cy * str * 4.0;
+    wishZ = -cy * gs - sy * str * 4.0;
+    accel = 2.6;
+  }
+  player.vel.x += (wishX - player.vel.x) * Math.min(1, accel * dt);
+  player.vel.z += (wishZ - player.vel.z) * Math.min(1, accel * dt);
+
+  if (player.fly) {
+    let up = 0;
+    if (keys['Space'] || keys['__jump']) up += 1;
+    if (keys['ShiftLeft'] || keys['ControlLeft'] || keys['__down']) up -= 1;
+    player.vel.y += (up * 9 - player.vel.y) * Math.min(1, 10 * dt);
+  } else if (player.inWater) {
+    player.vel.y += (-9.0 * dt);
+    if (keys['Space'] || keys['__jump']) player.vel.y += 22 * dt;
+    player.vel.y *= (1 - Math.min(1, 3.2 * dt));
+    player.vel.y = clamp(player.vel.y, -4.5, 4.2);
+  } else if (player.glide) {
+    // sink rate: a gentle float when looking level or up, a real dive when looking down
+    const dive = clamp(-player.pitch, -0.5, 1.2);
+    const sink = -2.6 - Math.max(0, dive) * 9.5 + Math.max(0, -dive) * 1.2;
+    player.vel.y += (sink - player.vel.y) * Math.min(1, 3.2 * dt);
+  } else {
+    player.vel.y -= 26 * dt;
+    if ((keys['Space'] || keys['__jump']) && player.onGround) { player.vel.y = 8.6; player.onGround = false; }
+    player.vel.y = Math.max(player.vel.y, -48);
+  }
+
+  const grounded = player.onGround;          // ground state carried from last frame
+  player.onGround = false;
+  const steps = Math.max(1, Math.ceil(player.vel.length() * dt / 0.35));
+  for (let i = 0; i < steps; i++) {
+    moveH('x', player.vel.x * dt / steps, grounded);
+    moveH('z', player.vel.z * dt / steps, grounded);
+    collide('y', player.vel.y * dt / steps);
+  }
+  ridePlatform();
+  if (player.pos.y < -20) { spawn(); player.vel.set(0, 0, 0); }
+
+  // camera: a bank into turns while gliding, a wider field of view at speed
+  const yawRate = (player.yaw - lastYaw) / Math.max(dt, 1e-3); lastYaw = player.yaw;
+  const wantRoll = player.glide ? clamp(yawRate * 0.10, -0.32, 0.32) + str * 0.06 : 0;
+  player.roll += (wantRoll - player.roll) * Math.min(1, 4 * dt);
+  player.glideT += ((player.glide ? 1 : 0) - player.glideT) * Math.min(1, 3 * dt);
+  const wantFov = BASE_FOV + player.glideT * 9 + (player.sprint && !player.fly && !player.glide ? 3 : 0);
+  if (Math.abs(camera.fov - wantFov) > 0.05) { camera.fov += (wantFov - camera.fov) * Math.min(1, 5 * dt); camera.updateProjectionMatrix(); }
+
+  camera.position.set(player.pos.x, player.pos.y + player.EYE, player.pos.z);
+  camera.rotation.set(player.pitch, player.yaw, player.roll, 'YXZ');
+  return headWater;
+}
+let lastYaw = 0;
+const BASE_FOV = 72;
+
+/* Space while falling opens the glider; Space again drops it. Jumping from the
+   ground is unaffected because the glider only arms after a moment airborne. */
+function openGlider() {
+  player.glide = true; player.wantGlide = false;
+  player.vel.y = Math.max(player.vel.y, -6);
+  toast('Glider open: look down to dive, up to float');
+  quest.event('glide');
+}
+function jumpPressed() {
+  if (player.fly || player.inWater || player.onGround) return;
+  if (player.glide) { player.glide = false; player.wantGlide = false; toast('Glider stowed: diving'); return; }
+  if (player.airTime > 0.25) openGlider();
+  else player.wantGlide = true;                 // pressed early: opens the moment it arms
+}
+
+/* ==================== raycast (DDA) ==================== */
+function pick(maxDist) {
+  const o = camera.position.clone();
+  const d = new THREE.Vector3(0, 0, -1).applyEuler(camera.rotation).normalize();
+  let x = Math.floor(o.x), y = Math.floor(o.y), z = Math.floor(o.z);
+  const sx = d.x > 0 ? 1 : -1, sy = d.y > 0 ? 1 : -1, sz = d.z > 0 ? 1 : -1;
+  const tdx = Math.abs(1 / (d.x || 1e-9)), tdy = Math.abs(1 / (d.y || 1e-9)), tdz = Math.abs(1 / (d.z || 1e-9));
+  let mx = ((d.x > 0 ? (x + 1 - o.x) : (o.x - x)) || 1e-9) * tdx;
+  let my = ((d.y > 0 ? (y + 1 - o.y) : (o.y - y)) || 1e-9) * tdy;
+  let mz = ((d.z > 0 ? (z + 1 - o.z) : (o.z - z)) || 1e-9) * tdz;
+  let nx = 0, ny = 0, nz = 0, t = 0;
+  while (t < maxDist) {
+    const id = world.get(x, y, z);
+    if (id !== AIR && id !== WATER) return { x, y, z, nx, ny, nz, id };
+    if (mx < my && mx < mz) { x += sx; t = mx; mx += tdx; nx = -sx; ny = 0; nz = 0; }
+    else if (my < mz) { y += sy; t = my; my += tdy; nx = 0; ny = -sy; nz = 0; }
+    else { z += sz; t = mz; mz += tdz; nx = 0; ny = 0; nz = -sz; }
+  }
+  return null;
+}
+
+function playerBoxIntersects(x, y, z) {
+  const hw = player.W / 2, p = player.pos;
+  return (x + 1 > p.x - hw && x < p.x + hw &&
+    y + 1 > p.y && y < p.y + player.H &&
+    z + 1 > p.z - hw && z < p.z + hw);
+}
+
+function breakBlock() {
+  const h = pick(6.5);
+  if (!h) return;
+  if (h.id === BEDROCK) return;
+  world.set(h.x, h.y, h.z, AIR);
+  edits.mark();
+  flash();
+}
+function placeBlock() {
+  const h = pick(6.5);
+  if (!h) return;
+  const x = h.x + h.nx, y = h.y + h.ny, z = h.z + h.nz;
+  if (y < 0 || y > MAXY) return;
+  const cur = world.get(x, y, z);
+  if (cur !== AIR && cur !== WATER) return;
+  if (playerBoxIntersects(x, y, z)) return;
+  world.set(x, y, z, HOTBAR[sel]);
+  edits.mark();
+  flash();
+}
+function pickBlock() {
+  const h = pick(6.5);
+  if (!h) return;
+  const i = HOTBAR.indexOf(h.id);
+  if (i >= 0) { sel = i; drawHotbar(); }
+}
+let flashT = 0;
+function flash() { flashT = 0.12; }
+
+/* ==================== input ==================== */
+let paused = true;
+function setPaused(v) {
+  paused = v;
+  $('menu').style.display = v ? 'flex' : 'none';
+  $('hud').style.opacity = v ? '0.25' : '1';
+  if (!v) { try { audio.init(); } catch (e) { } }
+  if (!v) { showLockHint(!isTouch); requestLook(); }
+  else { showLockHint(false); if (document.pointerLockElement === canvas) document.exitPointerLock(); }
+}
+
+// Pointer lock can be REFUSED, most commonly Chrome's ~1s cool-down after the
+// user exits with Escape. Previously that dropped us into a dead state: unpaused,
+// unlocked, mouse-look dead, and every click mining a block instead of recapturing
+// the cursor. Track the lock explicitly and always let a click re-acquire it.
+const locked = () => document.pointerLockElement === canvas;
+function requestLook() {
+  if (isTouch || locked()) return;
+  try {
+    const r = canvas.requestPointerLock();
+    if (r && typeof r.catch === 'function') r.catch(() => showLockHint(true));
+  } catch (e) { showLockHint(true); }
+}
+function showLockHint(v) {
+  const el = $('lockHint');
+  if (el) el.style.display = (v && !isTouch) ? 'block' : 'none';
+}
+canvas.addEventListener('click', () => {
+  if (paused) { setPaused(false); return; }
+  if (!locked()) requestLook();
+});
+document.addEventListener('pointerlockchange', () => {
+  if (isTouch) return;
+  if (locked()) { showLockHint(false); return; }
+  if (!paused) setPaused(true);
+});
+document.addEventListener('pointerlockerror', () => {
+  if (!paused && !isTouch) showLockHint(true);
+});
+document.addEventListener('mousemove', (e) => {
+  if (paused || document.pointerLockElement !== canvas) return;
+  player.yaw -= e.movementX * 0.0022;
+  player.pitch -= e.movementY * 0.0022;
+  player.pitch = clamp(player.pitch, -Math.PI / 2 + 0.02, Math.PI / 2 - 0.02);
+});
+canvas.addEventListener('mousedown', (e) => {
+  if (paused) return;
+  // a click made while the cursor is free recaptures the mouse, it never mines
+  if (!isTouch && !locked()) { e.preventDefault(); requestLook(); return; }
+  if (e.button === 0) breakBlock();
+  else if (e.button === 2) placeBlock();
+  else if (e.button === 1) { e.preventDefault(); pickBlock(); }
+});
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+let sel = 0;
+const typing = (e) => { const t = e.target; return t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA'); };
+function toggleFly() {
+  player.fly = !player.fly; player.vel.y = 0; player.glide = false; syncFlyUI();
+  toast(player.fly ? 'Flight ON' : 'Flight OFF');
+}
+function togglePhoto() {
+  document.body.classList.toggle('photo');
+  toast(document.body.classList.contains('photo') ? 'HUD hidden (H to restore)' : 'HUD shown');
+}
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape') { setPaused(!paused); return; }
+  if (typing(e)) return;                       // typing a seed must not fly you off a ledge
+  if (e.code === 'Space' && !keys['Space'] && !paused) jumpPressed();
+  keys[e.code] = true;
+  if (paused) return;
+  if (e.code.startsWith('Digit')) {
+    const n = +e.code.slice(5);
+    if (n >= 1 && n <= 9) { sel = n - 1; drawHotbar(); }
+    if (n === 0) { sel = 9; drawHotbar(); }
+  }
+  if (e.code === 'KeyF') toggleFly();
+  if (e.code === 'KeyG') { shotReq = true; }
+  if (e.code === 'KeyH') togglePhoto();
+  if (e.code === 'KeyM') { audio.on = !audio.on; $('mus').checked = audio.on; settings.sound = audio.on; saveSettings(); if (audio.on) audio.init(); toast(audio.on ? 'Sound on' : 'Sound off'); }
+  if (e.code === 'KeyR') gotoRave();
+  if (e.code === 'KeyO') gotoOverlook();
+  if (e.code === 'KeyT') gotoAerie();
+  if (e.code === 'KeyP') { POST.enabled = !POST.enabled; $('gfx').checked = POST.enabled; settings.gfx = POST.enabled; saveSettings();
+    toast(POST.enabled ? 'Enhanced graphics' : 'Standard graphics'); }
+  if (e.code === 'KeyC') gotoCity();
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+window.addEventListener('wheel', (e) => {
+  if (paused) return;
+  sel = (sel + (e.deltaY > 0 ? 1 : -1) + HOTBAR.length) % HOTBAR.length;
+  drawHotbar();
+}, { passive: true });
+
+/* ---- touch ---- */
+let syncFlyUI = () => { };
+if (isTouch) {
+  $('touch').style.display = 'block';
+  const stick = $('stick'), knob = $('knob');
+  const R = 52;
+  stick.addEventListener('touchstart', (e) => {
+    const t = e.changedTouches && e.changedTouches[0];
+    if (!t) return;
+    touchMove.active = true; touchMove.id = t.identifier;
+    const r = stick.getBoundingClientRect();
+    touchMove.ox = r.left + r.width / 2; touchMove.oy = r.top + r.height / 2;
+    e.preventDefault();
+  }, { passive: false });
+  window.addEventListener('touchmove', (e) => {
+    if (!e.changedTouches) return;
+    for (const t of e.changedTouches) {
+      if (touchMove.active && t.identifier === touchMove.id) {
+        let dx = t.clientX - touchMove.ox, dy = t.clientY - touchMove.oy;
+        const m = Math.hypot(dx, dy) || 1;
+        const cl = Math.min(m, R);
+        dx = dx / m * cl; dy = dy / m * cl;
+        knob.style.transform = `translate(${dx}px,${dy}px)`;
+        touchMove.x = dx / R; touchMove.y = dy / R;
+      } else if (look.id === t.identifier) {
+        player.yaw -= (t.clientX - look.px) * 0.0055;
+        player.pitch -= (t.clientY - look.py) * 0.0055;
+        player.pitch = clamp(player.pitch, -Math.PI / 2 + 0.02, Math.PI / 2 - 0.02);
+        look.px = t.clientX; look.py = t.clientY;
+      }
+    }
+  }, { passive: false });
+  window.addEventListener('touchend', (e) => {
+    if (!e.changedTouches) return;
+    for (const t of e.changedTouches) {
+      if (t.identifier === touchMove.id) {
+        touchMove.active = false; touchMove.id = -1; touchMove.x = touchMove.y = 0;
+        knob.style.transform = 'translate(0,0)';
+      }
+      if (t.identifier === look.id) look.id = -1;
+    }
+  });
+  const look = { id: -1, px: 0, py: 0 };
+  canvas.addEventListener('touchstart', (e) => {
+    if (paused) { setPaused(false); return; }
+    const t = e.changedTouches && e.changedTouches[0];
+    if (!t) return;
+    look.id = t.identifier; look.px = t.clientX; look.py = t.clientY;
+    e.preventDefault();
+  }, { passive: false });
+
+  const bind = (id, down, up) => {
+    const el = $(id);
+    el.addEventListener('touchstart', (e) => { down(); e.preventDefault(); }, { passive: false });
+    el.addEventListener('touchend', (e) => { if (up) up(); e.preventDefault(); }, { passive: false });
+  };
+  syncFlyUI = () => {
+    $('bDown').style.display = player.fly ? 'grid' : 'none';
+    $('bJump').textContent = player.fly ? 'Rise' : 'Jump';
+  };
+  bind('bJump', () => { if (!paused) jumpPressed(); keys['__jump'] = true; }, () => { keys['__jump'] = false; });
+  bind('bDown', () => { keys['__down'] = true; }, () => { keys['__down'] = false; });
+  bind('bFly', () => {
+    player.fly = !player.fly; player.vel.y = 0; player.glide = false; syncFlyUI();
+    toast(player.fly ? 'Flight ON: Rise / Sink' : 'Flight OFF');
+  });
+  bind('bMine', () => { mineHold = true; }, () => { mineHold = false; });
+  bind('bPlace', () => { placeBlock(); });
+  bind('bMenu', () => { setPaused(true); });
+  // a double-tap on the stick sprints
+  let lastStickTap = 0;
+  stick.addEventListener('touchstart', () => {
+    const now = performance.now();
+    keys['__sprint'] = (now - lastStickTap) < 320;
+    lastStickTap = now;
+  }, { passive: true });
+  stick.addEventListener('touchend', () => { keys['__sprint'] = false; }, { passive: true });
+}
+let mineHold = false, mineTimer = 0;
+
+/* ==================== HUD ==================== */
+let toastT = 0;
+function toast(msg) { $('toast').textContent = msg; toastT = 1.6; }
+
+const ICONS = new Map();
+function blockIcon(id) {
+  if (ICONS.has(id)) return ICONS.get(id);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 32;
+  const g = cv.getContext('2d');
+  g.imageSmoothingEnabled = false;
+  const tIdx = B[id].t[0];
+  const cx = (tIdx % COLS) * CELL + PAD, cy = ((tIdx / COLS) | 0) * CELL + PAD;
+  g.drawImage(atlasCanvas, cx, cy, TILE, TILE, 0, 0, 32, 32);
+  const url = cv.toDataURL('image/png');
+  ICONS.set(id, url);
+  return url;
+}
+function drawHotbar() {
+  const bar = $('hotbar');
+  bar.innerHTML = '';
+  HOTBAR.forEach((id, i) => {
+    const d = document.createElement('div');
+    d.className = 'slot' + (i === sel ? ' on' : '');
+    d.style.backgroundImage = 'url(' + blockIcon(id) + ')';
+    const n = document.createElement('span'); n.textContent = (i + 1) % 10; d.appendChild(n);
+    d.addEventListener('click', () => { sel = i; drawHotbar(); });
+    bar.appendChild(d);
+  });
+  $('blockName').textContent = B[HOTBAR[sel]].name;
+}
+
+/* ==================== day cycle ==================== */
+let timeOfDay = 0.30;   // 0..1 ; 0.25 = sunrise, 0.5 = noon
+if (HASHP.get('t')) { const tv = parseFloat(HASHP.get('t')); if (Number.isFinite(tv)) timeOfDay = clamp(tv, 0, 1); }
+let cycle = settings.cycle !== false;
+let nightAmt = 0;
+const sunDir = new THREE.Vector3();
+
+const DAY = {
+  top: new THREE.Color(0x2c6ba6), hor: new THREE.Color(0xc7e4f0),
+  sun: new THREE.Color(0xfff3d2), tint: new THREE.Color(1.00, 1.00, 1.00), fog: new THREE.Color(0xc2e0ec)
+};
+const DUSK = {
+  top: new THREE.Color(0x233f6e), hor: new THREE.Color(0xf0a86a),
+  sun: new THREE.Color(0xffc47a), tint: new THREE.Color(1.02, 0.86, 0.74), fog: new THREE.Color(0xe0a377)
+};
+const NIGHT = {
+  top: new THREE.Color(0x060d1c), hor: new THREE.Color(0x16233f),
+  sun: new THREE.Color(0x9ab4d8), tint: new THREE.Color(0.34, 0.40, 0.58), fog: new THREE.Color(0x101a2e)
+};
+const tmpA = new THREE.Color(), tmpB = new THREE.Color();
+const dayTint = new THREE.Color(1, 1, 1);
+const beatCol = new THREE.Color(1, 1, 1);
+
+function updateSky() {
+  const ang = (timeOfDay - 0.25) * Math.PI * 2;
+  sunDir.set(Math.cos(ang) * 0.55, Math.sin(ang), 0.42).normalize();
+  const el = sunDir.y;                     // -1..1
+  let A, Bp, t;
+  if (el > 0.22) { A = DUSK; Bp = DAY; t = smoothstep(0.22, 0.55, el); }
+  else if (el > -0.10) { A = NIGHT; Bp = DUSK; t = smoothstep(-0.10, 0.22, el); }
+  else { A = NIGHT; Bp = NIGHT; t = 0; }
+
+  skyMat.uniforms.uTop.value.copy(tmpA.copy(A.top).lerp(Bp.top, t));
+  skyMat.uniforms.uHor.value.copy(tmpB.copy(A.hor).lerp(Bp.hor, t));
+  skyMat.uniforms.uSunCol.value.copy(tmpA.copy(A.sun).lerp(Bp.sun, t));
+  skyMat.uniforms.uSun.value.copy(sunDir);
+  // stars and moon fade in as the sun drops below the horizon
+  nightAmt = 1 - smoothstep(-0.22, 0.02, el);
+  skyMat.uniforms.uNight.value = nightAmt;
+  // directional sun on the voxels: full strength by mid-morning, gone at dusk
+  sunShade.uniforms.uSunDir.value.copy(sunDir);
+  sunShade.uniforms.uSunStr.value = smoothstep(-0.04, 0.28, el);
+
+  const tint = tmpA.copy(A.tint).lerp(Bp.tint, t);
+  dayTint.copy(tint);
+  matOpaque.color.copy(tint); matCutout.color.copy(tint);
+  waterUniforms.uTint.value.copy(tint);
+  waterUniforms.uSun.value.copy(sunDir);
+
+  const fc = tmpB.copy(A.fog).lerp(Bp.fog, t);
+  if (!underwater) { fog.color.copy(fc); }
+  cloudMat.color.copy(tint).multiplyScalar(1.05);
+  cirrusMat.color.copy(tint).multiplyScalar(1.02);
+}
+
+/* ==================== THE SECRET RAVE, crowd, rig, sound ==================== */
+const RAVE_BPM = 128;
+const RAVE_BPS = RAVE_BPM / 60;
+
+const DANCER_PARTS = [
+  { part: 0, side: 0, w: 0.44, h: 0.42, d: 0.42, cy: 0.21, mount: [0, 1.40, 0] },   // head
+  { part: 1, side: 0, w: 0.46, h: 0.62, d: 0.26, cy: 0.31, mount: [0, 0.78, 0] },   // torso
+  { part: 2, side: 1, w: 0.15, h: 0.54, d: 0.15, cy: -0.27, mount: [0.31, 1.30, 0] },  // arm L
+  { part: 3, side: -1, w: 0.15, h: 0.54, d: 0.15, cy: -0.27, mount: [-0.31, 1.30, 0] }, // arm R
+  { part: 4, side: 1, w: 0.18, h: 0.52, d: 0.18, cy: -0.26, mount: [0.12, 0.78, 0] },   // leg L
+  { part: 5, side: -1, w: 0.18, h: 0.52, d: 0.18, cy: -0.26, mount: [-0.12, 0.78, 0] }  // leg R
+];
+
+const DANCER_VS = `
+#include <common>
+#include <fog_pars_vertex>
+attribute vec3 aPos; attribute vec3 aSkin; attribute vec3 aShirt;
+attribute float aPhase; attribute float aYaw; attribute float aStyle; attribute float aScale;
+uniform float uTime; uniform float uBps; uniform float uSide; uniform float uPart; uniform vec3 uMount;
+varying vec3 vCol; varying float vShade;
+mat3 rx(float a){ float c=cos(a), s=sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+mat3 ry(float a){ float c=cos(a), s=sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
+mat3 rz(float a){ float c=cos(a), s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+void main(){
+  float ph = (uTime * uBps + aPhase) * 6.2831853;
+  float bounce = abs(sin(ph));
+  float amp = aStyle > 3.5 ? 0.018            // idle residents: a breath, not a bounce
+            : (aStyle > 2.5 ? 0.36 : (aStyle > 1.5 ? 0.06 : (aStyle > 0.5 ? 0.19 : 0.12)));
+  float off = uSide > 0.0 ? 0.0 : 3.1415927;
+
+  mat3 R = mat3(1.0);
+  if (uPart < 0.5) {
+    R = rx(sin(ph) * 0.17 - 0.05);
+  } else if (uPart < 1.5) {
+    if (aStyle > 3.5 && aStyle < 4.5) R = rx(0.24 + sin(ph * 0.6) * 0.04);   // lean on rail
+    else R = rx(bounce * 0.10) * ry(sin(ph * 0.5) * 0.13);
+  } else if (uPart < 3.5) {
+    if (aStyle > 5.5) {                       // stall keeper: hands working the counter
+      R = rx(-1.05 + sin(ph * 2.4 + uSide) * 0.22);
+    } else if (aStyle > 4.5) {                // chatting: one hand gestures
+      R = uSide > 0.0 ? rx(-0.55 + sin(ph * 2.0) * 0.42) : rx(sin(ph * 0.7) * 0.10);
+    } else if (aStyle > 3.5) {                // leaning on the rail: forearms down
+      R = rx(-0.30 + sin(ph + off) * 0.05);
+    } else if (aStyle > 2.5) {
+      R = rz(uSide * (2.62 + sin(ph * 2.0 + uSide) * 0.18));
+    } else if (aStyle > 1.5) {
+      R = uSide > 0.0 ? rx(-1.25 + sin(ph * 2.0) * 0.30) : rz(-2.30 + sin(ph) * 0.24);
+    } else if (aStyle > 0.5) {
+      R = rz(uSide * (2.42 + sin(ph + uSide) * 0.30));
+    } else {
+      R = rx(sin(ph + off) * 0.80);
+    }
+  } else if (aStyle > 3.5) {
+    R = rx(sin(ph * 0.5 + off) * 0.05);       // idlers barely shift their weight
+  } else {
+    R = rx(sin(ph + off) * (aStyle > 2.5 ? 0.07 : (aStyle > 1.5 ? 0.10 : 0.26)));
+  }
+
+  vec3 local = uMount + R * position;
+  local.y += bounce * amp;
+  local = ry(aYaw) * local * aScale;
+  vec3 wpos = aPos + local;
+
+  vec3 nn = normalize(ry(aYaw) * (R * normal));
+  vShade = 0.50 + 0.50 * max(dot(nn, normalize(vec3(0.42, 0.86, 0.30))), 0.0);
+  bool isSkin = (uPart < 0.5) || (uPart > 1.5 && uPart < 3.5);
+  vCol = isSkin ? aSkin : (uPart > 3.5 ? aShirt * 0.55 : aShirt);
+
+  vec4 mvPosition = viewMatrix * vec4(wpos, 1.0);
+  gl_Position = projectionMatrix * mvPosition;
+  #include <fog_vertex>
+}`;
+
+const DANCER_FS = `
+#include <common>
+#include <fog_pars_fragment>
+uniform vec3 uTint; uniform vec3 uBeatCol; uniform float uBeat;
+varying vec3 vCol; varying float vShade;
+void main(){
+  vec3 c = vCol * vShade * uTint;
+  c += uBeatCol * uBeat * 0.34;
+  gl_FragColor = vec4(c, 1.0);
+  #include <fog_fragment>
+  #include <colorspace_fragment>
+}`;
+
+let raveGroup = null, raveParts = [], raveFloorMat = null, raveFloorMesh = null, raveCones = [], raveSite = null;
+let raveBanner = null, raveBannerGlow = null;
+
+function disposeRave() {
+  if (!raveGroup) return;
+  raveGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(raveGroup);
+  raveGroup = null; raveParts = []; raveCones = []; raveFloorMat = null; raveFloorMesh = null; raveSite = null;
+  raveBanner = null; raveBannerGlow = null;
+  disposeFX();
+}
+
+function buildRave() {
+  disposeRave();
+  const R = world.rave;
+  if (!R) return;
+  raveSite = R;
+  raveGroup = new THREE.Group();
+  raveGroup.frustumCulled = false;
+
+  /* ---------- crowd ---------- */
+  const COUNT = Q.crowd;                    // mainstage crowd, sized by the quality preset
+  const skins = [0xF0C9A0, 0xD9A272, 0xB07A4E, 0x8A5A38, 0x5C3A24].map((h) => new THREE.Color(h));
+  const shirts = [0xFF3D8B, 0x2ED9E6, 0xFFD23F, 0x9B5CFF, 0x35D07F, 0xFF7A29, 0xF2F5F8, 0x1B2430].map((h) => new THREE.Color(h));
+  const P = [], SK = [], SH = [], PH = [], YW = [], ST = [], SC = [];
+  const deckWorldZ = R.z + R.deckZ;
+  let i = 0;
+
+  const add = (x, y, z, style, scale) => {
+    let yaw = Math.atan2(R.x - x, deckWorldZ - z);
+    yaw += (rnd2(i, 91, 7) - 0.5) * 0.45;
+    P.push(x, y, z);
+    const sk = skins[(rnd2(i, 3, 11) * skins.length) | 0];
+    const sh = shirts[(rnd2(i, 5, 13) * shirts.length) | 0];
+    SK.push(sk.r, sk.g, sk.b); SH.push(sh.r, sh.g, sh.b);
+    // crowd bobs together on the beat, with a little human spread
+    PH.push(rnd2(i, 7, 17) * 0.14 + (rnd2(i, 9, 19) < 0.10 ? 0.5 : 0));
+    YW.push(yaw); ST.push(style); SC.push(scale);
+    i++;
+  };
+
+  let guard = 0;
+  while (i < COUNT && guard++ < COUNT * 60) {
+    const u = rnd2(guard, 1, 23), v = rnd2(guard, 2, 29);
+    const ang = u * Math.PI * 2;
+    const rad = Math.sqrt(v) * (R.rad - 1.2);
+    const dx = Math.cos(ang) * rad, dz = Math.sin(ang) * rad;
+    if (dz < R.stageZ1 + 1.5 && Math.abs(dx) <= R.stageX + 2) continue;     // not on the stage
+    if (Math.abs(dx) <= 1.5 && dz > R.inner - 2) continue;                  // keep the tunnel clear
+    if (R.ship && Math.abs(R.z + dz - R.ship.z) <= R.ship.L + 1 &&
+        Math.abs(R.x + dx - R.ship.x) <= R.ship.B + 1) continue;            // the galleon has its own crowd
+    // stand each dancer on the surface that actually generated, never assume
+    const gx = Math.floor(R.x + dx), gz = Math.floor(R.z + dz);
+    world.ensure(gx >> 4, gz >> 4);
+    const top = world.topOpaque(gx, gz);
+    if (top < R.floorY - 1 || top > R.floorY + 12) continue;                // outside the bowl profile
+    const under = world.get(gx, top, gz);
+    if (under === SPEAKER || under === DECK || under === LANTERN) continue; // not on the PA
+    const y = top + 1;
+    // jumpers cluster at the front; hands-up and bobbers fill the field
+    const frontness = clamp(1 - (rad + dz) / (R.rad * 1.4), 0, 1);
+    const roll = rnd2(guard, 4, 31);
+    const style = roll < 0.10 + 0.18 * frontness ? 3 : (roll < 0.48 ? 1 : 0);
+    add(R.x + dx, y, R.z + dz, style, 0.92 + rnd2(guard, 6, 37) * 0.22);
+  }
+  // ---- dancers all over the galleon: main deck, castles, crow's nests ----
+  if (R.ship) {
+    const SP = R.ship;
+    const want = Math.round(COUNT * 0.10);
+    let sg = 0;
+    for (let n2 = 0; n2 < want && sg < want * 40; ) {
+      sg++;
+      const u = (rnd2(sg, 51, 7301) * 2 - 1) * SP.L * 0.94;
+      const v = (rnd2(sg, 52, 7302) * 2 - 1) * SP.B * 0.85;
+      const gx = Math.floor(SP.x + v), gz = Math.floor(SP.z + u);
+      world.ensure(gx >> 4, gz >> 4);
+      // find any walkable surface on the ship, decks, castles, nests
+      let fy = -1;
+      for (let y = SP.mastTop; y >= SP.keel; y--) {
+        if (isSolid(world.get(gx, y, gz)) && !isSolid(world.get(gx, y + 1, gz)) &&
+            !isSolid(world.get(gx, y + 2, gz))) { fy = y; break; }
+      }
+      if (fy < SP.keel + 2) continue;
+      const roll = rnd2(sg, 53, 7303);
+      const style = roll < 0.30 ? 3 : (roll < 0.70 ? 1 : 0);
+      P.push(SP.x + v, fy + 1, SP.z + u);
+      const sk = skins[(rnd2(i, 3, 11) * skins.length) | 0];
+      const sh = shirts[(rnd2(i, 5, 13) * shirts.length) | 0];
+      SK.push(sk.r, sk.g, sk.b); SH.push(sh.r, sh.g, sh.b);
+      PH.push(rnd2(i, 7, 17) * 0.14);
+      YW.push(Math.atan2(R.x - (SP.x + v), (R.z + R.deckZ) - (SP.z + u)));
+      ST.push(style); SC.push(0.9 + rnd2(sg, 54, 7304) * 0.22);
+      i++; n2++;
+    }
+    R.shipCrowd = want;
+  }
+
+  // ---- every district gets its own crowd and its own DJ ----
+  // Split the non-mainstage budget evenly across every district, with the
+  // underground rooms weighted heavier because they have far more floor area.
+  const others = R.tiers.filter((T) => T.kind !== 'floor');
+  const weight = (T) => (T.kind === 'room' ? 1.6 : 1.0);
+  const wsum = others.reduce((a, T) => a + weight(T), 0);
+  const tierShare = {};
+  for (const T of others) tierShare[T.key] = (weight(T) / wsum) * 0.55;
+  for (const TR of R.tiers) {
+    if (TR.kind === 'floor') continue;
+    const want = Math.round(COUNT * (tierShare[TR.key] || 0.10));
+    const room = TR.kind === 'room';
+    let g2 = 0;
+    for (let n2 = 0; n2 < want && g2 < want * 30; ) {
+      g2++;
+      const ang = rnd2(g2, 41, TR.y) * Math.PI * 2;
+      const rad = room
+        ? 3 + Math.sqrt(rnd2(g2, 42, TR.y + 1)) * (R.inner - 6)
+        : (R.rad - 7.5) + rnd2(g2, 42, TR.y + 1) * 6;
+      const x = R.x + Math.cos(ang) * rad, z = R.z + Math.sin(ang) * rad;
+      const gx = Math.floor(x), gz = Math.floor(z);
+      world.ensure(gx >> 4, gz >> 4);
+      // stand on whatever this district actually generated, never on a formula
+      let fy = -1;
+      for (let y = TR.y + 2; y >= TR.y - 1; y--) {
+        if (isSolid(world.get(gx, y, gz)) && !isSolid(world.get(gx, y + 1, gz)) &&
+            !isSolid(world.get(gx, y + 2, gz))) { fy = y; break; }
+      }
+      if (fy < 0) continue;
+      const under = world.get(gx, fy, gz);
+      if (under === SPEAKER || under === DECK) continue;
+      // face this district's booth if it has one, else the mainstage
+      const face = (TR.djA !== null && TR.djA !== undefined)
+        ? Math.atan2(R.x + Math.cos(TR.djA) * (room ? R.inner - 6 : R.rad - 5) - x,
+                     R.z + Math.sin(TR.djA) * (room ? R.inner - 6 : R.rad - 5) - z)
+        : Math.atan2(R.x - x, (R.z + R.deckZ) - z);
+      const roll = rnd2(g2, 43, TR.y + 2);
+      const style = roll < 0.16 ? 3 : (roll < 0.55 ? 1 : 0);
+      P.push(x, fy + 1, z);
+      const sk = skins[(rnd2(i, 3, 11) * skins.length) | 0];
+      const sh = shirts[(rnd2(i, 5, 13) * shirts.length) | 0];
+      SK.push(sk.r, sk.g, sk.b); SH.push(sh.r, sh.g, sh.b);
+      PH.push(rnd2(i, 7, 17) * 0.14);
+      YW.push(face + (rnd2(i, 8, 23) - 0.5) * 0.4);
+      ST.push(style); SC.push(0.9 + rnd2(g2, 44, TR.y + 3) * 0.24);
+      i++;
+      n2++;
+    }
+    // fill the cantilevered boxes that hang out over the arena
+    if (!room) {
+      const BAYS = 16;
+      for (let bi = 0; bi < BAYS; bi += 2) {
+        for (let k2 = 0; k2 < 3; k2++) {
+          const a2 = ((bi + 0.5) / BAYS) * TAU - Math.PI + (k2 - 1) * 0.035;
+          const rr2 = R.rad - 8 - 1.5 - k2 * 1.2;
+          const x2 = R.x + Math.cos(a2) * rr2, z2 = R.z + Math.sin(a2) * rr2;
+          const gx2 = Math.floor(x2), gz2 = Math.floor(z2);
+          world.ensure(gx2 >> 4, gz2 >> 4);
+          if (!isSolid(world.get(gx2, TR.y, gz2))) continue;
+          if (isSolid(world.get(gx2, TR.y + 1, gz2)) || isSolid(world.get(gx2, TR.y + 2, gz2))) continue;
+          P.push(x2, TR.y + 1, z2);
+          const sk2 = skins[(rnd2(i, 3, 11) * skins.length) | 0];
+          const sh2 = shirts[(rnd2(i, 5, 13) * shirts.length) | 0];
+          SK.push(sk2.r, sk2.g, sk2.b); SH.push(sh2.r, sh2.g, sh2.b);
+          PH.push(rnd2(i, 7, 17) * 0.14);
+          YW.push(Math.atan2(R.x - x2, (R.z + R.deckZ) - z2));
+          ST.push(rnd2(i, 61, 71) < 0.5 ? 1 : 0);
+          SC.push(0.92 + rnd2(i, 62, 73) * 0.2);
+          i++;
+        }
+      }
+    }
+
+    // the district's resident DJ, up on its riser
+    if (TR.djA !== null && TR.djA !== undefined) {
+      const sr = room ? R.inner - 6 : R.rad - 5;
+      const bx = R.x + Math.cos(TR.djA) * sr, bz = R.z + Math.sin(TR.djA) * sr;
+      const gx = Math.floor(bx), gz = Math.floor(bz);
+      world.ensure(gx >> 4, gz >> 4);
+      let dy = TR.y + 2;
+      for (let y = TR.y + 4; y >= TR.y; y--) if (isSolid(world.get(gx, y, gz))) { dy = y + 1; break; }
+      add(bx, dy, bz - 1.2, 2, 1.06);
+      TR.dj = { x: bx, y: dy, z: bz };
+    }
+  }
+
+  // The DJ, behind the decks, facing the crowd. Raising the booth onto its
+  // riser left this figure buried two blocks under the new floor, so stand him
+  // on whatever surface the booth actually generated rather than a fixed offset.
+  {
+    const bx = Math.floor(R.x), bz = Math.floor(deckWorldZ - 1.2);
+    world.ensure(bx >> 4, bz >> 4);
+    let djY = R.stageTop + 1;
+    for (let y = R.stageTop + 12; y >= R.stageTop; y--) {
+      if (isSolid(world.get(bx, y, bz)) && !isSolid(world.get(bx, y + 1, bz))) { djY = y + 1; break; }
+    }
+    add(R.x, djY, deckWorldZ - 1.2, 2, 1.06);
+    R.djStand = djY;
+  }
+  const N = i;
+
+  const attrs = {
+    aPos: new THREE.InstancedBufferAttribute(new Float32Array(P), 3),
+    aSkin: new THREE.InstancedBufferAttribute(new Float32Array(SK), 3),
+    aShirt: new THREE.InstancedBufferAttribute(new Float32Array(SH), 3),
+    aPhase: new THREE.InstancedBufferAttribute(new Float32Array(PH), 1),
+    aYaw: new THREE.InstancedBufferAttribute(new Float32Array(YW), 1),
+    aStyle: new THREE.InstancedBufferAttribute(new Float32Array(ST), 1),
+    aScale: new THREE.InstancedBufferAttribute(new Float32Array(SC), 1)
+  };
+
+  for (const spec of DANCER_PARTS) {
+    const box = new THREE.BoxGeometry(spec.w, spec.h, spec.d);
+    box.translate(0, spec.cy, 0);
+    const geo = new THREE.InstancedBufferGeometry();
+    geo.setIndex(box.getIndex());
+    geo.setAttribute('position', box.getAttribute('position'));
+    geo.setAttribute('normal', box.getAttribute('normal'));
+    for (const k in attrs) geo.setAttribute(k, attrs[k]);
+    geo.instanceCount = N;
+    const mat = new THREE.ShaderMaterial({
+      fog: true,
+      uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {
+        uTime: { value: 0 }, uBps: { value: RAVE_BPS }, uSide: { value: spec.side },
+        uPart: { value: spec.part }, uMount: { value: new THREE.Vector3() },
+        uTint: { value: new THREE.Color(1, 1, 1) }, uBeatCol: { value: new THREE.Color(1, 1, 1) },
+        uBeat: { value: 0 }
+      }]),
+      vertexShader: DANCER_VS, fragmentShader: DANCER_FS
+    });
+    mat.uniforms.uMount.value.set(spec.mount[0], spec.mount[1], spec.mount[2]);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    raveGroup.add(mesh);
+    raveParts.push(mat);
+  }
+
+  /* ---------- pulsing dance floor ---------- */
+  const FP = [], FPH = [];
+  for (let gx = -R.inner; gx < R.inner; gx += 2) {
+    for (let gz = -R.inner; gz < R.inner; gz += 2) {
+      const cx = gx + 1, cz = gz + 1;
+      const d = Math.hypot(cx, cz);
+      if (d > R.inner - 1) continue;
+      if (cz < R.stageZ1 + 1 && Math.abs(cx) <= R.stageX + 1) continue;
+      FP.push(R.x + cx, R.floorY + 1.03, R.z + cz);
+      FPH.push(d);
+    }
+  }
+  if (FP.length) {
+    const quad = new THREE.PlaneGeometry(1.9, 1.9).rotateX(-Math.PI / 2);
+    const fgeo = new THREE.InstancedBufferGeometry();
+    fgeo.setIndex(quad.getIndex());
+    fgeo.setAttribute('position', quad.getAttribute('position'));
+    fgeo.setAttribute('aPos', new THREE.InstancedBufferAttribute(new Float32Array(FP), 3));
+    fgeo.setAttribute('aDist', new THREE.InstancedBufferAttribute(new Float32Array(FPH), 1));
+    fgeo.instanceCount = FPH.length;
+    raveFloorMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+      uniforms: { uTime: { value: 0 }, uBps: { value: RAVE_BPS }, uA: { value: new THREE.Color(0xff2f8e) }, uB: { value: new THREE.Color(0x22d3ee) } },
+      vertexShader: `
+        attribute vec3 aPos; attribute float aDist;
+        uniform float uTime; uniform float uBps;
+        varying float vA; varying float vMix;
+        void main(){
+          float t = uTime * uBps;
+          float w = sin(t * 6.2831853 - aDist * 0.45);
+          vA = pow(max(w, 0.0), 3.0);
+          vMix = 0.5 + 0.5 * sin(uTime * 0.55 + aDist * 0.22);
+          vec3 wp = aPos + position;
+          gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 uA; uniform vec3 uB;
+        varying float vA; varying float vMix;
+        void main(){
+          vec3 c = mix(uA, uB, vMix);
+          gl_FragColor = vec4(c * vA * 0.85, vA * 0.5);
+          #include <colorspace_fragment>
+        }`
+    });
+    raveFloorMesh = new THREE.Mesh(fgeo, raveFloorMat);
+    raveFloorMesh.frustumCulled = false;
+    raveGroup.add(raveFloorMesh);
+  }
+
+  /* ---------- headline banner: D33 SECRET rAIVE ---------- */
+  {
+    const bw = 1024, bh = 300;
+    const cv = document.createElement('canvas'); cv.width = bw; cv.height = bh;
+    const g = cv.getContext('2d');
+    // panel
+    g.fillStyle = 'rgba(6,9,18,0.94)'; g.fillRect(0, 0, bw, bh);
+    g.strokeStyle = '#d4a138'; g.lineWidth = 6; g.strokeRect(10, 10, bw - 20, bh - 20);
+    g.strokeStyle = 'rgba(212,161,56,0.35)'; g.lineWidth = 2; g.strokeRect(22, 22, bw - 44, bh - 44);
+    for (let y = 0; y < bh; y += 6) { g.fillStyle = 'rgba(255,255,255,0.022)'; g.fillRect(0, y, bw, 2); }
+    g.textBaseline = 'middle';
+    // "D33" crest
+    g.font = '900 118px Helvetica, Arial, sans-serif';
+    g.textAlign = 'left';
+    g.shadowColor = '#d4a138'; g.shadowBlur = 34;
+    g.fillStyle = '#d4a138'; g.fillText('D33', 58, 128);
+    g.shadowBlur = 0;
+    g.font = '700 30px Helvetica, Arial, sans-serif';
+    g.fillStyle = '#9fb0c2'; g.fillText('P R E S E N T S', 62, 208);
+    // "SECRET rAIVE" with AI lit in cyan
+    const segs = [['SECRET ', '#f2f5f8', '#f2f5f8'], ['r', '#ff2f8e', '#ff2f8e'], ['AI', '#22d3ee', '#22d3ee'], ['VE', '#ff2f8e', '#ff2f8e']];
+    g.font = '900 128px Helvetica, Arial, sans-serif';
+    let tw = 0; for (const [t] of segs) tw += g.measureText(t).width;
+    let x = bw - 64 - tw;
+    for (const [t, fill, glow] of segs) {
+      g.shadowColor = glow; g.shadowBlur = 30;
+      g.fillStyle = fill; g.fillText(t, x, 128);
+      x += g.measureText(t).width;
+    }
+    g.shadowBlur = 0;
+    g.font = '700 30px Helvetica, Arial, sans-serif';
+    g.textAlign = 'right';
+    g.fillStyle = '#9fb0c2'; g.fillText('HEADLINE SET \u00b7 128 BPM \u00b7 ONE NIGHT ONLY', bw - 64, 208);
+    // beat tick marks along the bottom rail
+    for (let i = 0; i < 32; i++) { g.fillStyle = i % 4 === 0 ? '#22d3ee' : 'rgba(159,176,194,0.5)'; g.fillRect(58 + i * 28, 252, 12, i % 4 === 0 ? 16 : 9); }
+
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 4;
+    const W2 = (R.stageX + 2) * 2;                 // pylon to pylon
+    const H2 = W2 * (bh / bw);
+    const geo = new THREE.PlaneGeometry(W2, H2);
+    raveBanner = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, fog: false }));
+    raveBanner.position.set(R.x, R.floorY + 15.6, R.z + R.stageZ0 + 0.4);
+    raveBanner.frustumCulled = false;
+    raveGroup.add(raveBanner);
+    raveBannerGlow = new THREE.Mesh(geo.clone(), new THREE.MeshBasicMaterial({
+      map: tex, side: THREE.DoubleSide, fog: false, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.0
+    }));
+    raveBannerGlow.position.copy(raveBanner.position);
+    raveBannerGlow.scale.setScalar(1.012);
+    raveBannerGlow.frustumCulled = false;
+    raveGroup.add(raveBannerGlow);
+  }
+
+  /* ---------- lighting rig ---------- */
+  const CONE_COLS = [0xff2f8e, 0x22d3ee, 0xffd23f, 0x9b5cff, 0x35d07f, 0xff7a29];
+  for (let k = 0; k < 0; k++) {   // superseded by the volumetric beam rig in buildFX
+    const g = new THREE.ConeGeometry(3.6, 24, 14, 1, true);
+    g.translate(0, -12, 0);
+    const m = new THREE.MeshBasicMaterial({
+      color: CONE_COLS[k % CONE_COLS.length], transparent: true, opacity: 0.10, depthWrite: false,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false
+    });
+    const cone = new THREE.Mesh(g, m);
+    cone.position.set(R.x - 10.5 + k * 3, R.floorY + 13.5, deckWorldZ + 2);
+    cone.frustumCulled = false;
+    raveGroup.add(cone);
+    raveCones.push(cone);
+  }
+
+  scene.add(raveGroup);
+
+  // ---- the light show ----
+  buildFX(R, deckWorldZ);
+  attachCrowdGlow(attrs.aPos, N);
+}
+
+/* ---------- the set: a small WebAudio techno rig, gated on a user gesture ---------- */
+const audio = {
+  ctx: null, on: true, started: false, noise: null,
+  init() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try { this.ctx = new AC(); } catch (e) { return; }
+    this.master = this.ctx.createGain(); this.master.gain.value = 0;
+    this.lp = this.ctx.createBiquadFilter(); this.lp.type = 'lowpass'; this.lp.frequency.value = 400;
+    this.lp.Q.value = 0.7;
+    this.lp.connect(this.master); this.master.connect(this.ctx.destination);
+    const len = this.ctx.sampleRate * 0.4;
+    this.noise = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const nd = this.noise.getChannelData(0);
+    for (let i = 0; i < len; i++) nd[i] = Math.random() * 2 - 1;
+    this.next = this.ctx.currentTime + 0.08; this.step = 0;
+    this.timer = setInterval(() => this.pump(), 35);
+    this.started = true;
+    this.initAmbient();
+  },
+  /* Ambience: wind that rises with altitude and airspeed, surf that swells
+     along the tideline. Two filtered noise loops, gains steered per frame. */
+  initAmbient() {
+    const C = this.ctx;
+    const mk = (type, freq, q) => {
+      const n = C.createBufferSource(); n.buffer = this.noise; n.loop = true;
+      const f = C.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+      const g = C.createGain(); g.gain.value = 0;
+      n.connect(f); f.connect(g); g.connect(C.destination);
+      n.start();
+      return { n, f, g };
+    };
+    this.wind = mk('lowpass', 420, 0.6);
+    this.surf = mk('bandpass', 520, 0.45);
+    this.ambT = 0;
+  },
+  setAmbience(dt) {
+    if (!this.ctx || !this.wind) return;
+    this.ambT += dt;
+    const on = this.on ? 1 : 0;
+    const p = player;
+    const alt = clamp((p.pos.y - SEA - 22) / 120, 0, 1);
+    const speed = Math.hypot(p.vel.x, p.vel.z);
+    const windAmt = on * (underwater ? 0 : clamp(alt * 0.55 + p.glideT * 0.75 + (p.fly ? speed / 30 : 0), 0, 1));
+    this.wind.g.gain.setTargetAtTime(windAmt * 0.075, this.ctx.currentTime, 0.4);
+    this.wind.f.frequency.setTargetAtTime(380 + windAmt * 900 + Math.sin(this.ambT * 0.7) * 120, this.ctx.currentTime, 0.5);
+    let shore = 0;
+    if (!underwater && Math.abs(p.pos.y - SEA) < 9) {
+      const c = world.column(Math.round(p.pos.x), Math.round(p.pos.z));
+      shore = clamp(1 - Math.abs(p.pos.y - SEA) / 9, 0, 1) * (c.h < SEA + 4 ? 1 : 0.35);
+    }
+    const swell = 0.55 + 0.45 * Math.sin(this.ambT * 0.75) * Math.sin(this.ambT * 0.31 + 1.3);
+    this.surf.g.gain.setTargetAtTime(on * shore * 0.06 * swell, this.ctx.currentTime, 0.35);
+  },
+  chime() {
+    if (!this.ctx || !this.on) return;
+    const C = this.ctx, t = C.currentTime + 0.01;
+    for (const [f, dt0] of [[880, 0], [1318.5, 0.11], [1760, 0.22]]) {
+      const o = C.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+      const g = C.createGain(); g.gain.setValueAtTime(0.0001, t + dt0);
+      g.gain.exponentialRampToValueAtTime(0.09, t + dt0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dt0 + 0.35);
+      o.connect(g); g.connect(C.destination);
+      o.start(t + dt0); o.stop(t + dt0 + 0.4);
+      setTimeout(() => { try { o.disconnect(); g.disconnect(); } catch (e) { } }, 900);
+    }
+  },
+  env(node, t, a, d, peak) {
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+    node.connect(g); g.connect(this.lp);
+    return g;
+  },
+  pump() {
+    if (!this.ctx) return;
+    // far from the venue we keep the clock running (the crowd stays on-beat)
+    // but schedule nothing at all, no synthesis cost, no battery cost
+    if (!this.audible) { this.next = this.ctx.currentTime + 0.08; return; }
+    const sixteenth = 60 / RAVE_BPM / 4;
+    while (this.next < this.ctx.currentTime + 0.18) {
+      this.voice(this.step, this.next);
+      this.next += sixteenth; this.step = (this.step + 1) % 64;
+    }
+  },
+  voice(s, t) {
+    const C = this.ctx, b = s % 16;
+    // arrangement: 64-step phrase. Last 16 steps build (filter opens, snare roll
+    // doubles), step 0 is the drop. The visual energy curve reads the same clock.
+    const bar = Math.floor(s / 16);
+    const building = bar === 3;
+    const dropStep = s === 0;
+    if (dropStep) {
+      // impact: sub boom + noise sweep
+      const o = C.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(220, t); o.frequency.exponentialRampToValueAtTime(32, t + 0.9);
+      const g = this.env(o, t, 0.005, 1.1, 1.0);
+      o.start(t); o.stop(t + 1.3); setTimeout(() => { try { o.disconnect(); g.disconnect(); } catch (e) { } }, 1800);
+      const n = C.createBufferSource(); n.buffer = this.noise; n.loop = true;
+      const bp = C.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.2;
+      bp.frequency.setValueAtTime(6000, t); bp.frequency.exponentialRampToValueAtTime(400, t + 0.8);
+      n.connect(bp);
+      const g2 = this.env(bp, t, 0.01, 0.85, 0.35);
+      n.start(t); n.stop(t + 1.0); setTimeout(() => { try { n.disconnect(); bp.disconnect(); g2.disconnect(); } catch (e) { } }, 1600);
+    }
+    // four-on-the-floor kick
+    if (b % 4 === 0) {
+      const o = C.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(150, t);
+      o.frequency.exponentialRampToValueAtTime(44, t + 0.10);
+      const g = this.env(o, t, 0.004, 0.20, 1.0);
+      o.start(t); o.stop(t + 0.26); setTimeout(() => { try { o.disconnect(); g.disconnect(); } catch (e) { } }, 700);
+    }
+    // hats
+    if (b % 4 === 2 || (b % 8 === 7)) {
+      const n = C.createBufferSource(); n.buffer = this.noise;
+      const hp = C.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7800;
+      n.connect(hp);
+      const g = this.env(hp, t, 0.002, b % 8 === 7 ? 0.11 : 0.035, 0.18);
+      n.start(t); n.stop(t + 0.2); setTimeout(() => { try { n.disconnect(); hp.disconnect(); g.disconnect(); } catch (e) { } }, 700);
+    }
+    // build: accelerating snare roll through the last bar
+    if (building) {
+      const dens = (s % 16) >= 8 ? 1 : 2;
+      if (s % dens === 0) {
+        const n = C.createBufferSource(); n.buffer = this.noise;
+        const bp = C.createBiquadFilter(); bp.type = 'bandpass';
+        bp.frequency.value = 1900; bp.Q.value = 0.9;
+        n.connect(bp);
+        const amp = 0.10 + 0.22 * ((s % 16) / 16);
+        const g = this.env(bp, t, 0.003, 0.07, amp);
+        n.start(t); n.stop(t + 0.2); setTimeout(() => { try { n.disconnect(); bp.disconnect(); g.disconnect(); } catch (e) { } }, 700);
+      }
+    }
+
+    // rolling bass
+    const BASS = [0, -1, 0, 0, 3, 0, -1, 0, 0, 0, 5, 0, 3, 0, 0, -1];
+    if (BASS[b] !== -1 && b % 2 === 0) {
+      const semi = BASS[b];
+      const o = C.createOscillator(); o.type = 'sawtooth';
+      o.frequency.value = 55 * Math.pow(2, semi / 12);
+      const f = C.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 340; f.Q.value = 6;
+      o.connect(f);
+      const g = this.env(f, t, 0.006, 0.16, 0.42);
+      o.start(t); o.stop(t + 0.26); setTimeout(() => { try { o.disconnect(); f.disconnect(); g.disconnect(); } catch (e) { } }, 700);
+    }
+    // chord stab every other bar
+    if (s === 8 || s === 40 || s === 44) {
+      for (const semi of [0, 3, 7, 10]) {
+        const o = C.createOscillator(); o.type = 'sawtooth';
+        o.frequency.value = 220 * Math.pow(2, semi / 12);
+        o.detune.value = (Math.random() - 0.5) * 14;
+        const g = this.env(o, t, 0.008, 0.28, 0.10);
+        o.start(t); o.stop(t + 0.4); setTimeout(() => { try { o.disconnect(); g.disconnect(); } catch (e) { } }, 900);
+      }
+    }
+  },
+  // an outdoor rave: you hear the bass long before you can hear the hats
+  setDistance(d) {
+    if (!this.ctx) return;
+    const near = clamp(1 - (d - 26) / 170, 0, 1);
+    this.audible = this.on && near > 0.002;
+    const target = this.on ? near * 0.5 : 0;
+    this.master.gain.setTargetAtTime(target, this.ctx.currentTime, 0.25);
+    // distance sets the ceiling; the arrangement rides underneath it, so a build
+    // audibly opens up and the drop slams, but only when you are close enough.
+    const E = raveEnergy(this.ctx.currentTime * RAVE_BPS);
+    const arr = 0.45 + 0.55 * clamp(E.energy, 0, 1);
+    this.lp.frequency.setTargetAtTime(300 + Math.pow(near, 2.2) * 11000 * arr, this.ctx.currentTime, 0.20);
+  }
+};
+
+/* ==================== RAVE FX, beams, lasers, pyro, LED, drops ====================
+   Everything here is GPU-analytic: particle motion, beam sweeps and laser fans are
+   pure functions of time in the vertex shader, so the whole show costs ~10 draw
+   calls and no per-frame CPU regardless of particle count. */
+
+const BAR = 4;            // beats per bar
+const PHRASE = 16;        // bars per phrase -> 64 beats, matches the 64-step sequencer
+
+let fx = null;
+
+/* Musical position -> visual energy. One source of truth so lights, lasers,
+   pyro and the LED wall all peak on the same beat the music does. */
+function raveEnergy(beats) {
+  const inPhrase = ((beats / BAR) % PHRASE + PHRASE) % PHRASE;   // 0..16 bars
+  const build = smoothstep(11, 15.9, inPhrase);                   // last 4 bars climb
+  const sinceDrop = inPhrase * BAR;                               // beats since phrase start
+  // the drop must out-peak the build, or the payoff feels smaller than the run-up
+  const drop = Math.exp(-sinceDrop * 0.5) * 1.35;
+  const base = 0.30 + 0.26 * smoothstep(0, 4, inPhrase);
+  return {
+    inPhrase, build, drop,
+    energy: clamp(Math.max(base + build * 0.36, drop), 0, 1.35),
+    beat: Math.pow(1 - ((beats % 1) + 1) % 1, 3)
+  };
+}
+
+const FX_COLS = [
+  new THREE.Color(0xff2f8e), new THREE.Color(0x22d3ee), new THREE.Color(0xffd23f),
+  new THREE.Color(0x9b5cff), new THREE.Color(0x35d07f), new THREE.Color(0xff7a29)
+];
+
+function disposeFX() {
+  if (!fx) return;
+  fx.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(fx.group);
+  if (fx.flash) { camera.remove(fx.flash); fx.flash.geometry.dispose(); fx.flash.material.dispose(); }
+  fx = null;
+}
+
+function buildFX(R, deckWorldZ) {
+  const group = new THREE.Group();
+  group.frustumCulled = false;
+  const mats = [];
+  const U = () => ({
+    uTime: { value: 0 }, uBps: { value: RAVE_BPS }, uEnergy: { value: 0 },
+    uBeat: { value: 0 }, uDrop: { value: 0 }, uBuild: { value: 0 }
+  });
+  const reg = (m) => { mats.push(m); return m; };
+
+  const stageY = R.floorY;
+  const rigY = stageY + 14;
+
+  /* ---------- 1. volumetric beams: soft-edged cones, sweeping ---------- */
+  const beamVS = `
+    uniform float uTime, uBps, uEnergy, uBeat, uDrop;
+    attribute float aIdx;
+    varying float vY, vR, vIdx;
+    mat3 rz(float a){ float c=cos(a),s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+    mat3 rx(float a){ float c=cos(a),s=sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+    void main(){
+      vIdx = aIdx;
+      float t = uTime * uBps;
+      float ph = aIdx * 0.9;
+      // sweep pattern morphs with energy: gentle fan -> wide scissor
+      float sweep = sin(t * 0.55 + ph) * (0.35 + uEnergy * 0.85);
+      float tilt  = 0.34 + sin(t * 0.37 + ph * 1.7) * (0.16 + uEnergy * 0.30);
+      vec3 p = rz(sweep) * (rx(tilt) * position);
+      vY = -position.y / 26.0;                     // 0 at emitter, 1 at far end
+      vR = length(position.xz) / max(0.0001, 4.2 * (0.4 + vY));
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_Position = projectionMatrix * mv;
+    }`;
+  const beamFS = `
+    uniform float uEnergy, uBeat, uDrop, uTime, uBps;
+    varying float vY, vR, vIdx;
+    void main(){
+      float radial = pow(1.0 - clamp(vR, 0.0, 1.0), 2.2);   // soft edge, no hard cone rim
+      float fall   = pow(1.0 - clamp(vY, 0.0, 1.0), 1.5);   // fades with throw distance
+      float flick  = 0.82 + 0.18 * sin(uTime * uBps * 6.2831853 * 4.0 + vIdx);
+      float a = radial * fall * flick * (0.06 + uEnergy * 0.20 + uBeat * 0.10 + uDrop * 0.22);
+      vec3 c = COLOR;
+      gl_FragColor = vec4(c * (1.0 + uDrop * 1.4), a);
+      #include <colorspace_fragment>
+    }`;
+  const beams = [];
+  for (let k = 0; k < 10; k++) {
+    const g = new THREE.CylinderGeometry(0.35, 4.2, 26, 12, 1, true);
+    g.translate(0, -13, 0);
+    const n = g.attributes.position.count;
+    g.setAttribute('aIdx', new THREE.BufferAttribute(new Float32Array(n).fill(k), 1));
+    const col = FX_COLS[k % FX_COLS.length];
+    const m = reg(new THREE.ShaderMaterial({
+      uniforms: U(), vertexShader: beamVS,
+      fragmentShader: beamFS.replace('COLOR', `vec3(${col.r.toFixed(3)},${col.g.toFixed(3)},${col.b.toFixed(3)})`),
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide, fog: false
+    }));
+    const mesh = new THREE.Mesh(g, m);
+    mesh.position.set(R.x - 13.5 + k * 3, rigY, R.z + deckWorldZ + 2 - R.z);
+    mesh.position.z = deckWorldZ + 2;
+    mesh.frustumCulled = false;
+    group.add(mesh); beams.push(mesh);
+  }
+
+  /* ---------- 2. laser fan: thin blades from the truss, only at high energy ---------- */
+  const laserVS = `
+    uniform float uTime, uBps, uEnergy, uDrop, uBuild;
+    attribute float aIdx;
+    varying float vLen, vIdx;
+    mat3 rz(float a){ float c=cos(a),s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+    mat3 rx(float a){ float c=cos(a),s=sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+    void main(){
+      vIdx = aIdx; vLen = -position.y / 40.0;
+      float t = uTime * uBps;
+      float spread = (aIdx - 7.5) * (0.055 + 0.045 * sin(t * 0.5));
+      float roll = sin(t * 0.9) * 0.5 + floor(t / 8.0) * 1.3;
+      vec3 p = rz(spread + roll) * (rx(0.62 + sin(t * 0.6) * 0.22) * position);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    }`;
+  const laserFS = `
+    uniform float uEnergy, uDrop, uBuild, uTime, uBps;
+    varying float vLen, vIdx;
+    void main(){
+      float gate = smoothstep(0.55, 0.95, uEnergy) + uDrop;
+      float chop = step(0.5, fract(uTime * uBps * 2.0 + vIdx * 0.13));  // strobing blades
+      float a = (1.0 - clamp(vLen,0.0,1.0)) * gate * (0.35 + 0.65 * chop) * 0.5;
+      vec3 c = mix(vec3(0.13,0.95,0.85), vec3(1.0,0.18,0.55), fract(vIdx*0.37));
+      gl_FragColor = vec4(c * 1.6, a);
+      #include <colorspace_fragment>
+    }`;
+  {
+    const g = new THREE.PlaneGeometry(0.16, 40, 1, 1);
+    g.translate(0, -20, 0);
+    const merged = new THREE.BufferGeometry();
+    const pos = [], idx = [], ai = [];
+    const src = g.attributes.position.array, si = g.index.array;
+    for (let k = 0; k < 16; k++) {
+      const base = pos.length / 3;
+      for (let i = 0; i < src.length; i++) pos.push(src[i]);
+      for (let i = 0; i < g.attributes.position.count; i++) ai.push(k);
+      for (const v of si) idx.push(base + v);
+    }
+    merged.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    merged.setAttribute('aIdx', new THREE.Float32BufferAttribute(ai, 1));
+    merged.setIndex(idx);
+    const m = reg(new THREE.ShaderMaterial({
+      uniforms: U(), vertexShader: laserVS, fragmentShader: laserFS,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide, fog: false
+    }));
+    const mesh = new THREE.Mesh(merged, m);
+    mesh.position.set(R.x, rigY + 1, deckWorldZ + 1.5);
+    mesh.frustumCulled = false;
+    group.add(mesh);
+  }
+
+  /* ---------- 3. confetti + sparks, ballistic, launched on the drop ---------- */
+  const partVS = `
+    uniform float uTime, uBps, uDrop, uEnergy;
+    attribute vec3 aOrigin; attribute vec3 aVel; attribute float aSeed;
+    varying float vAlpha; varying vec3 vCol;
+    void main(){
+      // cannons fire on a fixed 20-second cycle, and again on every drop
+      float cycle = 20.0;
+      float lastCannon = floor(uTime / cycle) * cycle;
+      float beats = uTime * uBps;
+      float lastDrop = floor(beats / 64.0) * 64.0 / uBps;
+      float launch = max(lastCannon, lastDrop);
+      float age = (uTime - launch) / 2.2 + aSeed * 0.05;
+      float life = clamp(age, 0.0, 1.0);
+      vec3 p = aOrigin + aVel * age * 3.2;
+      p.y -= 9.0 * age * age;                                    // gravity
+      p.x += sin(age * 6.0 + aSeed * 12.0) * age * 1.4;          // flutter
+      vAlpha = (1.0 - life) * (1.0 - smoothstep(0.85, 1.0, life));
+      vCol = mix(vec3(1.0,0.25,0.6), vec3(0.2,0.9,1.0), fract(aSeed * 7.3));
+      vCol = mix(vCol, vec3(1.0,0.85,0.35), step(0.66, fract(aSeed*3.1)));
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_PointSize = (34.0 / max(1.0, -mv.z)) * (1.0 + aSeed);
+      gl_Position = projectionMatrix * mv;
+    }`;
+  const partFS = `
+    varying float vAlpha; varying vec3 vCol;
+    void main(){
+      vec2 d = gl_PointCoord - 0.5;
+      float m = 1.0 - smoothstep(0.18, 0.5, length(d));
+      gl_FragColor = vec4(vCol * 2.0, vAlpha * m);
+      #include <colorspace_fragment>
+    }`;
+  {
+    const N = Math.round(2600 * Q.fx);
+    const org = new Float32Array(N * 3), vel = new Float32Array(N * 3), sd = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const side = i % 2 ? 1 : -1;
+      const jet = (i % 6) / 6;
+      org[i * 3] = R.x + side * (R.stageX - 1) * (0.4 + jet * 0.9);
+      org[i * 3 + 1] = R.stageTop + 1;
+      org[i * 3 + 2] = deckWorldZ + 2;
+      const a = rnd2(i, 3, 91) * Math.PI * 2, s = 0.35 + rnd2(i, 5, 77);
+      vel[i * 3] = Math.cos(a) * s * 1.7;
+      vel[i * 3 + 1] = 2.6 + rnd2(i, 7, 51) * 2.4;
+      vel[i * 3 + 2] = Math.abs(Math.sin(a)) * s * 2.4;      // blown out over the crowd
+      sd[i] = rnd2(i, 9, 33);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(N * 3), 3));
+    g.setAttribute('aOrigin', new THREE.Float32BufferAttribute(org, 3));
+    g.setAttribute('aVel', new THREE.Float32BufferAttribute(vel, 3));
+    g.setAttribute('aSeed', new THREE.Float32BufferAttribute(sd, 1));
+    const m = reg(new THREE.ShaderMaterial({
+      uniforms: U(), vertexShader: partVS, fragmentShader: partFS,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false
+    }));
+    const pts = new THREE.Points(g, m);
+    pts.frustumCulled = false;
+    group.add(pts);
+  }
+
+  /* ---------- 4. crowd handheld lights ---------- */
+  const glowVS = `
+    uniform float uTime, uBps, uEnergy, uBeat;
+    attribute float aSeed;
+    varying float vA; varying vec3 vCol;
+    void main(){
+      float t = uTime * uBps;
+      float bob = abs(sin((t + aSeed) * 6.2831853)) * 0.34;
+      vec3 p = position; p.y += bob + 0.55;
+      float on = step(0.35, fract(aSeed * 17.3));            // not everyone holds one
+      vA = on * (0.35 + uEnergy * 0.5 + uBeat * 0.25);
+      vCol = mix(vec3(1.0,0.95,0.75), vec3(0.4,0.8,1.0), fract(aSeed*5.1));
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_PointSize = 26.0 / max(1.0, -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }`;
+  const glowFS = `
+    varying float vA; varying vec3 vCol;
+    void main(){
+      float m = 1.0 - smoothstep(0.0, 0.5, length(gl_PointCoord - 0.5));
+      gl_FragColor = vec4(vCol * 1.8, vA * m * m);
+      #include <colorspace_fragment>
+    }`;
+  let crowdGlow = null;
+
+  /* ---------- 5. LED wall behind the DJ ---------- */
+  const ledFS = `
+    uniform float uTime, uBps, uEnergy, uBeat, uDrop, uBuild;
+    varying vec2 vUv;
+    void main(){
+      vec2 uv = vUv;
+      float t = uTime * uBps;
+      float mode = floor(mod(t / 32.0, 3.0));
+      vec3 c;
+      if (mode < 0.5) {
+        float bars = step(fract(uv.x * 16.0), 0.72);
+        float h = fract(sin(floor(uv.x * 16.0) * 12.9898) * 43758.5453);
+        float lvl = 0.15 + 0.85 * abs(sin(t * 3.1416 + h * 6.28)) * (0.3 + uEnergy);
+        c = vec3(step(uv.y, lvl)) * bars * mix(vec3(1.0,0.2,0.55), vec3(0.15,0.9,1.0), h);
+      } else if (mode < 1.5) {
+        float r = length(uv - 0.5);
+        float rings = sin(r * 42.0 - t * 6.2831853);
+        c = vec3(smoothstep(0.55, 1.0, rings)) * mix(vec3(0.2,0.9,1.0), vec3(1.0,0.85,0.3), sin(t*0.4)*0.5+0.5);
+      } else {
+        vec2 g = floor(uv * vec2(24.0, 12.0));
+        float n = fract(sin(dot(g, vec2(12.9898, 78.233)) + floor(t * 2.0)) * 43758.5453);
+        c = vec3(step(0.62 - uEnergy * 0.25, n)) * mix(vec3(1.0,0.3,0.7), vec3(0.5,1.0,0.6), fract(g.x*0.13));
+      }
+      c += uDrop * 1.2;
+      float scan = 0.85 + 0.15 * sin(uv.y * 220.0);
+      gl_FragColor = vec4(c * scan * (0.55 + uEnergy * 0.8), 1.0);
+      #include <colorspace_fragment>
+    }`;
+  {
+    const w = (R.stageX + 1) * 2, h = 9;
+    const g = new THREE.PlaneGeometry(w, h);
+    const m = reg(new THREE.ShaderMaterial({
+      uniforms: U(),
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+      fragmentShader: ledFS, side: THREE.DoubleSide, fog: false
+    }));
+    const mesh = new THREE.Mesh(g, m);
+    mesh.position.set(R.x, stageY + 6.5, R.z + R.stageZ0 - 0.45);
+    mesh.frustumCulled = false;
+    group.add(mesh);
+  }
+
+  /* ---------- 6. sky beacons, find the party from across the island ---------- */
+  {
+    const g = new THREE.CylinderGeometry(1.2, 9, 150, 10, 1, true);
+    g.translate(0, 75, 0);
+    const n = g.attributes.position.count;
+    g.setAttribute('aIdx', new THREE.BufferAttribute(new Float32Array(n).fill(0), 1));
+    const m = reg(new THREE.ShaderMaterial({
+      uniforms: U(),
+      vertexShader: `
+        uniform float uTime, uBps; varying float vY;
+        mat3 rz(float a){ float c=cos(a),s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+        void main(){
+          vY = position.y / 150.0;
+          vec3 p = rz(sin(uTime * uBps * 0.12) * 0.22) * position;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(p,1.0);
+        }`,
+      fragmentShader: `
+        uniform float uEnergy, uDrop; varying float vY;
+        void main(){
+          float a = pow(1.0 - clamp(vY,0.0,1.0), 2.0) * (0.05 + uEnergy * 0.06 + uDrop * 0.10);
+          gl_FragColor = vec4(vec3(0.55,0.85,1.0) * 1.2, a);
+          #include <colorspace_fragment>
+        }`,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide, fog: false
+    }));
+    const mesh = new THREE.Mesh(g, m);
+    mesh.position.set(R.x, stageY + 2, R.z);
+    mesh.frustumCulled = false;
+    group.add(mesh);
+  }
+
+  /* ---------- 7. strobe flash, parented to the camera ---------- */
+  const flashMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0, depthWrite: false,
+    depthTest: false, blending: THREE.AdditiveBlending, fog: false, side: THREE.DoubleSide
+  });
+  const flash = new THREE.Mesh(new THREE.PlaneGeometry(4, 3), flashMat);
+  flash.position.set(0, 0, -1);
+  flash.frustumCulled = false;
+  flash.renderOrder = 999;
+  flash.visible = false;
+  camera.add(flash);
+  if (!scene.children.includes(camera)) scene.add(camera);
+
+  scene.add(group);
+  fx = { group, mats, beams, flash, flashMat, crowdGlow, glowVS, glowFS, R };
+  return fx;
+}
+
+/* attach the handheld lights once the crowd positions exist */
+function attachCrowdGlow(posAttr, count) {
+  if (!fx || fx.crowdGlow) return;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', posAttr);
+  const sd = new Float32Array(count);
+  for (let i = 0; i < count; i++) sd[i] = rnd2(i, 13, 61);
+  g.setAttribute('aSeed', new THREE.Float32BufferAttribute(sd, 1));
+  const m = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 }, uBps: { value: RAVE_BPS }, uEnergy: { value: 0 },
+      uBeat: { value: 0 }, uDrop: { value: 0 }, uBuild: { value: 0 }
+    },
+    vertexShader: fx.glowVS, fragmentShader: fx.glowFS,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false
+  });
+  const pts = new THREE.Points(g, m);
+  pts.frustumCulled = false;
+  fx.group.add(pts);
+  fx.mats.push(m);
+  fx.crowdGlow = pts;
+}
+
+function updateFX(raveT, dist) {
+  if (!fx) return null;
+  const beats = raveT * RAVE_BPS;
+  const E = raveEnergy(beats);
+  const near = dist < 260;
+  fx.group.visible = near;
+  if (near) {
+    for (const m of fx.mats) {
+      const u = m.uniforms;
+      u.uTime.value = raveT; u.uEnergy.value = E.energy;
+      u.uBeat.value = E.beat; u.uDrop.value = E.drop; u.uBuild.value = E.build;
+    }
+    // strobe only when you're inside the bowl, and only on the drop
+    // inside the bowl means inside the stadium's height too: the Aerie sits
+    // directly above the crater and must never strobe
+    const inside = dist < fx.R.rad + 6 && settings.strobe &&
+      player.pos.y > fx.R.floorY - 48 && player.pos.y < fx.R.topY + 10;
+    const s = inside ? (E.drop * 0.32 + (E.build > 0.75 ? (Math.sin(beats * 25) > 0.6 ? 0.18 : 0) : 0)) : 0;
+    fx.flash.visible = s > 0.004;
+    fx.flashMat.opacity = Math.min(s, 0.4);
+  } else {
+    fx.flash.visible = false;
+  }
+  return E;
+}
+
+/* ==================== PORTAL & WAYFINDING ====================
+   A trail of floating chevrons from the sky city down to the seafloor gate,
+   plus the gate's own volumetric glow. Arrows fade out once you have arrived,
+   and stop rendering entirely after the first transit. */
+
+let guide = null, portalFxMat = null, portalGroup = null;
+let portalArmed = true, portalCooldown = 0, transitFlash = 0;
+
+function disposeGuide() {
+  if (portalGroup) {
+    portalGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+    scene.remove(portalGroup);
+  }
+  portalGroup = null; guide = null; portalFxMat = null;
+}
+
+function buildGuide() {
+  disposeGuide();
+  const P = world.portal;
+  if (!P) return;
+  portalGroup = new THREE.Group();
+  portalGroup.frustumCulled = false;
+
+  // the trail runs from the Aerie's prow to the gate (or from wherever you
+  // are, on seeds without an Aerie)
+  const A = world.aerie;
+  const from = A ? new THREE.Vector3(A.prowTip.x + 0.5, A.y + 2, A.prowTip.z + 0.5)
+                 : new THREE.Vector3(player.pos.x, player.pos.y, player.pos.z);
+  const to = new THREE.Vector3(P.x + 0.5, P.floor + 4, P.z + 0.5);
+
+  /* ---- chevron trail: arrow-shaped prisms strung along the descent ---- */
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 1.15); shape.lineTo(-0.95, -0.30); shape.lineTo(-0.34, -0.30);
+  shape.lineTo(-0.34, -1.15); shape.lineTo(0.34, -1.15); shape.lineTo(0.34, -0.30);
+  shape.lineTo(0.95, -0.30); shape.closePath();
+  const arrowGeo = new THREE.ExtrudeGeometry(shape, { depth: 0.26, bevelEnabled: false });
+  arrowGeo.center();
+
+  // one chevron every ~14 blocks; the Aerie is a long way up
+  const N = clamp(Math.round(from.distanceTo(to) / 14), 20, 52);
+  const pos = [], seed = [], prog = [];
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    // arc out over the ledge, then dive: sag the middle so it reads as a descent
+    const p = from.clone().lerp(to, t);
+    p.y = from.y + (to.y - from.y) * Math.pow(t, 1.35) + Math.sin(t * Math.PI) * 6.0;
+    pos.push(p.x, p.y, p.z);
+    seed.push(rnd2(i, 3, 8821));
+    prog.push(t);
+  }
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.setIndex(arrowGeo.getIndex());
+  geo.setAttribute('position', arrowGeo.getAttribute('position'));
+  geo.setAttribute('normal', arrowGeo.getAttribute('normal'));
+  geo.setAttribute('aPos', new THREE.InstancedBufferAttribute(new Float32Array(pos), 3));
+  geo.setAttribute('aSeed', new THREE.InstancedBufferAttribute(new Float32Array(seed), 1));
+  geo.setAttribute('aProg', new THREE.InstancedBufferAttribute(new Float32Array(prog), 1));
+  geo.instanceCount = N;
+
+  const target = new THREE.Vector3().copy(to);
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide, fog: false,
+    uniforms: {
+      uTime: { value: 0 }, uFade: { value: 1 }, uTarget: { value: target },
+      uPlayer: { value: new THREE.Vector3() }
+    },
+    vertexShader: `
+      attribute vec3 aPos; attribute float aSeed; attribute float aProg;
+      uniform float uTime, uFade; uniform vec3 uTarget; uniform vec3 uPlayer;
+      varying float vA; varying float vEdge;
+      mat3 ry(float a){ float c=cos(a),s=sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
+      mat3 rx(float a){ float c=cos(a),s=sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+      void main(){
+        // each chevron points along the trail toward the gate
+        vec3 dir = normalize(uTarget - aPos + vec3(0.0001));
+        float yaw = atan(dir.x, dir.z);
+        float pitch = asin(clamp(-dir.y, -1.0, 1.0));
+        vec3 p = ry(yaw) * (rx(-pitch) * position * 1.5);
+        // a pulse of brightness runs down the chain toward the portal
+        float wave = fract(uTime * 0.45 - aProg * 1.2);
+        float pulse = pow(1.0 - abs(wave - 0.5) * 2.0, 3.0);
+        float bob = sin(uTime * 2.0 + aSeed * 6.28) * 0.22;
+        vec3 wpos = aPos + vec3(0.0, bob, 0.0) + p;
+        // fade the ones you have already passed
+        float behind = smoothstep(6.0, 26.0, distance(uPlayer, aPos));
+        vA = uFade * (0.30 + pulse * 0.85) * behind;
+        vEdge = abs(position.z) * 3.4;
+        gl_Position = projectionMatrix * viewMatrix * vec4(wpos, 1.0);
+      }`,
+    fragmentShader: `
+      varying float vA; varying float vEdge;
+      void main(){
+        vec3 c = mix(vec3(1.0, 0.25, 0.72), vec3(1.0, 0.75, 0.95), vEdge);
+        gl_FragColor = vec4(c * 1.5, vA);
+        #include <colorspace_fragment>
+      }`
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  portalGroup.add(mesh);
+
+  /* ---- the gate's own glow: a soft slab in front of the sheet ---- */
+  portalFxMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide, fog: false,
+    uniforms: { uTime: { value: 0 } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform float uTime; varying vec2 vUv;
+      void main(){
+        vec2 d = vUv - 0.5;
+        float r = length(d * vec2(1.0, 0.62));
+        float swirl = sin(atan(d.y, d.x) * 3.0 + uTime * 1.7 - r * 12.0) * 0.5 + 0.5;
+        float core = pow(1.0 - clamp(r * 1.7, 0.0, 1.0), 2.0);
+        float a = core * (0.35 + swirl * 0.4);
+        gl_FragColor = vec4(vec3(1.0, 0.22, 0.68) * 1.8 + swirl * 0.3, a);
+        #include <colorspace_fragment>
+      }`
+  });
+  const glow = new THREE.Mesh(new THREE.PlaneGeometry(P.w + 6, P.h + 6), portalFxMat);
+  glow.position.set(P.x + 0.5, P.floor + 1 + (P.h + 1) / 2, P.z + 0.5);
+  glow.frustumCulled = false;
+  portalGroup.add(glow);
+  const glow2 = glow.clone();
+  glow2.rotation.y = Math.PI / 2;
+  portalGroup.add(glow2);
+
+  scene.add(portalGroup);
+  guide = { mesh, mat, target: to };
+}
+
+/* Is the player standing in the gate? */
+function checkPortal(dt) {
+  if (portalCooldown > 0) portalCooldown -= dt;
+  if (transitFlash > 0) transitFlash -= dt * 1.6;
+  const P = world.portal;
+  if (!P || portalCooldown > 0) return;
+  const dx = player.pos.x - (P.x + 0.5), dz = player.pos.z - (P.z + 0.5);
+  if (Math.abs(dx) > 3.2 || Math.abs(dz) > 2.2) return;
+  const y = player.pos.y;
+  if (y < P.floor + 1 || y > P.floor + 1 + P.h) return;
+  enterPortal();
+}
+
+function enterPortal() {
+  const R = world.rave;
+  if (!R) return;
+  // land in the middle of the dancefloor, facing the stage
+  // the galleon now occupies the centre, land on open floor just off its beam
+  const off = R.ship ? R.ship.B + 4 : 0;
+  const cx = R.x + off + 0.5, cz = R.z + Math.round(R.inner * 0.35) + 0.5;
+  world.ensure(Math.floor(cx) >> 4, Math.floor(cz) >> 4);
+  let ty = world.topOpaque(Math.floor(cx), Math.floor(cz)) + 1;
+  if (ty < R.floorY || ty > R.floorY + 6) ty = R.floorY + 1;   // never on a roof or a mast
+  player.pos.set(cx, ty + 0.05, cz);
+  player.vel.set(0, 0, 0);
+  player.fly = false;
+  player.yaw = faceYaw(cx, cz, R.x, R.z + R.deckZ);     // face the DJ booth
+  player.pitch = 0;
+  placeCamera();
+  portalCooldown = 2.5;
+  transitFlash = 1;
+  portalArmed = false;                      // arrows retire after first transit
+  if (guide) guide.mat.uniforms.uFade.value = 0;
+  try { audio.init(); } catch (e) { }
+  warmup(700);
+  toast('\u2726  THE SECRET RAVE  \u2726');
+  quest.event('portal');
+  if (typeof syncFlyUI === 'function') syncFlyUI();
+}
+
+/* ==================== UFOs, saucers over the canopy ====================
+   Hovering craft high above the tree city, each throwing a sweeping beam down
+   through the canopy. They double as extra strobes for the rave: their beams
+   read the same energy curve as the stage rig, so the whole island pulses
+   together on the drop. All motion is analytic in the shader. */
+
+let ufos = null;
+
+function disposeUFOs() {
+  if (!ufos) return;
+  ufos.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(ufos.group);
+  ufos = null;
+}
+
+function buildUFOs() {
+  disposeUFOs();
+  const C = world.city, R = world.rave;
+  if (!C || !C.trees.length) return;
+
+  const group = new THREE.Group();
+  group.frustumCulled = false;
+  const mats = [];
+
+  const N = Math.max(3, Math.round(7 * Q.fx));
+  const sites = [];
+  for (let i = 0; i < N; i++) {
+    // ring the city, a couple parked over the crater itself
+    const overRave = i >= N - 2 && R;
+    const t = C.trees[i % C.trees.length];
+    const ang = (i / N) * TAU + rnd2(i, 3, 5501) * 0.9;
+    const rad = overRave ? 10 + rnd2(i, 5, 91) * 14 : 26 + rnd2(i, 5, 77) * 34;
+    const cx = (overRave ? R.x : t.x) + Math.cos(ang) * rad;
+    const cz = (overRave ? R.z : t.z) + Math.sin(ang) * rad;
+    const base = overRave ? R.floorY : t.top;
+    sites.push({
+      x: cx, z: cz,
+      y: base + (overRave ? 46 : 26) + rnd2(i, 7, 33) * 14,   // well above the canopy
+      seed: rnd2(i, 11, 17), scale: 0.85 + rnd2(i, 13, 29) * 0.7, i
+    });
+  }
+
+  /* ---- hulls: a lathed saucer with a lit rim and a dome ---- */
+  const hullPts = [];
+  for (let i = 0; i <= 12; i++) {
+    const t = i / 12;
+    const r = Math.sin(t * Math.PI) * 4.6 + 0.15;
+    const y = Math.cos(t * Math.PI) * 0.95;
+    hullPts.push(new THREE.Vector2(Math.max(0.05, r), y));
+  }
+  const hullGeo = new THREE.LatheGeometry(hullPts, 22);
+  const domeGeo = new THREE.SphereGeometry(1.9, 16, 10, 0, Math.PI * 2, 0, Math.PI / 2);
+  const rimGeo = new THREE.TorusGeometry(3.5, 0.32, 8, 26);
+  rimGeo.rotateX(Math.PI / 2);
+
+  for (const st of sites) {
+    const hull = new THREE.Mesh(hullGeo, new THREE.MeshBasicMaterial({
+      color: 0x2a3346, fog: true
+    }));
+    const dome = new THREE.Mesh(domeGeo, new THREE.MeshBasicMaterial({
+      color: 0x7fe3ff, transparent: true, opacity: 0.55, fog: true
+    }));
+    dome.position.y = 0.55;
+    const rimMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+      uniforms: { uTime: { value: 0 }, uEnergy: { value: 0 }, uSeed: { value: st.seed } },
+      vertexShader: `varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+      fragmentShader: `
+        uniform float uTime, uEnergy, uSeed; varying vec3 vP;
+        void main(){
+          float a = atan(vP.z, vP.x);
+          // chasing lights around the rim, faster and brighter with the music
+          float chase = fract(a / 6.2831853 * 8.0 - uTime * (0.9 + uEnergy * 2.2) + uSeed);
+          float lamp = pow(chase, 6.0);
+          vec3 c = mix(vec3(1.0,0.25,0.7), vec3(0.35,0.95,1.0), fract(uSeed * 7.0 + floor(a)));
+          gl_FragColor = vec4(c * (1.4 + uEnergy), 0.35 + lamp * 0.65);
+          #include <colorspace_fragment>
+        }`
+    });
+    mats.push(rimMat);
+    const rim = new THREE.Mesh(rimGeo, rimMat);
+    rim.position.y = -0.15;
+
+    /* ---- abduction beam: sweeping, strobing cone ---- */
+    const len = 60;
+    const beamGeo = new THREE.CylinderGeometry(1.1, 11, len, 18, 1, true);
+    beamGeo.translate(0, -len / 2, 0);
+    const beamMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide, fog: false,
+      uniforms: {
+        uTime: { value: 0 }, uEnergy: { value: 0 }, uBeat: { value: 0 },
+        uDrop: { value: 0 }, uSeed: { value: st.seed }, uBps: { value: RAVE_BPS }
+      },
+      vertexShader: `
+        uniform float uTime, uSeed, uEnergy;
+        varying float vY, vR;
+        mat3 rz(float a){ float c=cos(a),s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+        mat3 rx(float a){ float c=cos(a),s=sin(a); return mat3(1.,0.,0., 0.,c,s, 0.,-s,c); }
+        void main(){
+          float t = uTime;
+          vec3 p = rz(sin(t * 0.33 + uSeed * 9.0) * (0.22 + uEnergy * 0.35))
+                 * (rx(cos(t * 0.27 + uSeed * 5.0) * (0.20 + uEnergy * 0.30)) * position);
+          vY = -position.y / 60.0;
+          vR = length(position.xz) / max(0.001, 1.1 + vY * 10.0);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+        }`,
+      fragmentShader: `
+        uniform float uTime, uEnergy, uBeat, uDrop, uSeed, uBps;
+        varying float vY, vR;
+        void main(){
+          float radial = pow(1.0 - clamp(vR, 0.0, 1.0), 2.0);
+          float fall = pow(1.0 - clamp(vY, 0.0, 1.0), 1.25);
+          // strobe chops the beam into slices on the beat
+          float strobe = step(0.45, fract(uTime * uBps * 2.0 + uSeed * 3.0));
+          float rings = 0.55 + 0.45 * sin(vY * 34.0 - uTime * 5.0);
+          float a = radial * fall * rings * (0.05 + uEnergy * 0.10 + uBeat * 0.07 + uDrop * 0.16)
+                  * (0.45 + 0.55 * strobe);
+          vec3 c = mix(vec3(0.45,1.0,0.85), vec3(1.0,0.4,0.85), fract(uSeed * 3.7));
+          gl_FragColor = vec4(c * (1.0 + uDrop), a);
+          #include <colorspace_fragment>
+        }`
+    });
+    mats.push(beamMat);
+    const beam = new THREE.Mesh(beamGeo, beamMat);
+    beam.position.y = -0.6;
+    beam.frustumCulled = false;
+
+    const craft = new THREE.Group();
+    craft.add(hull); craft.add(dome); craft.add(rim); craft.add(beam);
+    craft.scale.setScalar(st.scale);
+    craft.position.set(st.x, st.y, st.z);
+    craft.frustumCulled = false;
+    craft.userData = st;
+    group.add(craft);
+  }
+
+  scene.add(group);
+  ufos = { group, mats, sites };
+}
+
+function updateUFOs(t, E) {
+  if (!ufos) return;
+  const energy = E ? E.energy : 0.4, beat = E ? E.beat : 0, drop = E ? E.drop : 0;
+  for (const m of ufos.mats) {
+    const u = m.uniforms;
+    if (u.uTime) u.uTime.value = t;
+    if (u.uEnergy) u.uEnergy.value = energy;
+    if (u.uBeat) u.uBeat.value = beat;
+    if (u.uDrop) u.uDrop.value = drop;
+  }
+  for (const c of ufos.group.children) {
+    const st = c.userData;
+    // slow patrol drift plus a hover bob, so they never look pasted on
+    c.position.y = st.y + Math.sin(t * 0.55 + st.seed * 6.3) * 1.6;
+    c.position.x = st.x + Math.sin(t * 0.16 + st.seed * 4.1) * 9;
+    c.position.z = st.z + Math.cos(t * 0.13 + st.seed * 2.7) * 9;
+    c.rotation.y = t * (0.14 + st.seed * 0.10);
+    c.rotation.z = Math.sin(t * 0.4 + st.seed) * 0.06;
+  }
+}
+
+/* ==================== RESIDENTS, the city is inhabited ====================
+   Reuses the dancer instancing: one InstancedBufferGeometry per body part, all
+   motion analytic in the vertex shader. Hundreds of villagers for 6 draw calls.
+   They idle rather than rave, leaning on rails, chatting in pairs, working
+   stalls, so the city reads as lived-in and the crater reads as the party. */
+
+let residents = null, residentMats = [];
+
+function disposeResidents() {
+  if (!residents) return;
+  residents.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(residents);
+  residents = null; residentMats = [];
+}
+
+function buildResidents() {
+  disposeResidents();
+  const C = world.city;
+  if (!C || !C.trees.length) return;
+
+  const P = [], SK = [], SH = [], PH = [], YW = [], ST = [], SC = [];
+  const skins = [0xF0C9A0, 0xD9A272, 0xB07A4E, 0x8A5A38, 0x5C3A24].map((h) => new THREE.Color(h));
+  const shirts = [0xE8E2D2, 0x7FA8C9, 0xC96B5A, 0x8FB47A, 0xD9B45A, 0x6E5A8C, 0xCFCFD6, 0x3E4A63]
+    .map((h) => new THREE.Color(h));
+  let i = 0;
+  const add = (x, y, z, yaw, style, scale) => {
+    P.push(x, y, z);
+    const sk = skins[(rnd2(i, 3, 611) * skins.length) | 0];
+    const sh = shirts[(rnd2(i, 5, 733) * shirts.length) | 0];
+    SK.push(sk.r, sk.g, sk.b); SH.push(sh.r, sh.g, sh.b);
+    PH.push(rnd2(i, 7, 811));                 // fully spread, idlers are not in sync
+    YW.push(yaw); ST.push(style); SC.push(scale);
+    i++;
+  };
+
+  const cap = Math.round(900 * Q.fx);
+  for (const t of C.trees) {
+    world.ensure(t.x >> 4, t.z >> 4);
+    for (let k = 0; k < t.decks.length && i < cap; k++) {
+      const dk = t.decks[k];
+      // line the railings: leaners looking out over the archipelago
+      const along = Math.max(10, Math.round(dk.r * 2.6));
+      for (let a = 0; a < along && i < cap; a++) {
+        const ang = (a / along) * TAU + rnd2(i, 11, 97) * 0.2;
+        let open = false;
+        for (const g of dk.gaps) if (angDist(ang, g) < 0.30) open = true;
+        if (open) continue;
+        if (rnd2(i, 13, 131) > 0.82) continue;         // leave a few gaps at the rail
+        const rr = dk.r - 2.2;                         // inside the railing blocks
+        const x = t.x + Math.cos(ang) * rr, z = t.z + Math.sin(ang) * rr;
+        const gx = Math.floor(x), gz = Math.floor(z);
+        world.ensure(gx >> 4, gz >> 4);
+        if (!isSolid(world.get(gx, dk.y, gz))) continue;
+        if (isSolid(world.get(gx, dk.y + 1, gz))) continue;
+        add(x, dk.y + 1, z, ang, 4, 0.92 + rnd2(i, 17, 53) * 0.2);   // 4 = lean on rail
+      }
+      // clusters chatting mid-deck, facing each other
+      const groups = k === 0 ? 5 : 4;
+      for (let g = 0; g < groups && i < cap; g++) {
+        const ga = t.ang + g * (TAU / groups) + rnd2(i, 19, 71) * 0.7;
+        const gr = dk.r * 0.55;
+        const cxp = t.x + Math.cos(ga) * gr, czp = t.z + Math.sin(ga) * gr;
+        const n = 2 + ((rnd2(i, 23, 41) * 3) | 0);
+        for (let m = 0; m < n && i < cap; m++) {
+          const ma = (m / n) * TAU;
+          const x = cxp + Math.cos(ma) * 1.1, z = czp + Math.sin(ma) * 1.1;
+          const gx = Math.floor(x), gz = Math.floor(z);
+          world.ensure(gx >> 4, gz >> 4);
+          if (!isSolid(world.get(gx, dk.y, gz)) || isSolid(world.get(gx, dk.y + 1, gz))) continue;
+          add(x, dk.y + 1, z, ma + Math.PI, 5, 0.9 + rnd2(i, 29, 37) * 0.24);  // 5 = idle chat
+        }
+      }
+      // porch sitters outside the houses on this deck
+      for (const hut of t.huts) {
+        if (i >= cap) break;
+        if (Math.abs(hut.y - (dk.y + 1)) > 0.5) continue;
+        const px2 = Math.round(hut.x + Math.cos(hut.a + Math.PI) * (hut.w + 2));
+        const pz2 = Math.round(hut.z + Math.sin(hut.a + Math.PI) * (hut.d + 2));
+        world.ensure(px2 >> 4, pz2 >> 4);
+        if (!isSolid(world.get(px2, dk.y, pz2)) || isSolid(world.get(px2, dk.y + 1, pz2))) continue;
+        add(px2 + 0.5, dk.y + 1, pz2 + 0.5, hut.a + Math.PI, 5, 0.9 + rnd2(i, 31, 67) * 0.2);
+      }
+
+      // stall keepers on the lowest deck
+      if (k === 0) {
+        for (let sIdx = 0; sIdx < 5 && i < cap; sIdx++) {
+          const sa = t.ang + 0.6 + sIdx * (TAU / 5);
+          const sr = dk.r - 3.2;
+          const x = t.x + Math.cos(sa) * sr, z = t.z + Math.sin(sa) * sr;
+          const gx = Math.floor(x), gz = Math.floor(z);
+          world.ensure(gx >> 4, gz >> 4);
+          if (!isSolid(world.get(gx, dk.y, gz)) || isSolid(world.get(gx, dk.y + 1, gz))) continue;
+          add(x, dk.y + 1, z, sa, 6, 0.95);           // 6 = working, arms busy
+        }
+      }
+    }
+  }
+  if (!i) return;
+
+  const attrs = {
+    aPos: new THREE.InstancedBufferAttribute(new Float32Array(P), 3),
+    aSkin: new THREE.InstancedBufferAttribute(new Float32Array(SK), 3),
+    aShirt: new THREE.InstancedBufferAttribute(new Float32Array(SH), 3),
+    aPhase: new THREE.InstancedBufferAttribute(new Float32Array(PH), 1),
+    aYaw: new THREE.InstancedBufferAttribute(new Float32Array(YW), 1),
+    aStyle: new THREE.InstancedBufferAttribute(new Float32Array(ST), 1),
+    aScale: new THREE.InstancedBufferAttribute(new Float32Array(SC), 1)
+  };
+
+  residents = new THREE.Group();
+  residents.frustumCulled = false;
+  for (const spec of DANCER_PARTS) {
+    const box = new THREE.BoxGeometry(spec.w, spec.h, spec.d);
+    box.translate(0, spec.cy, 0);
+    const geo = new THREE.InstancedBufferGeometry();
+    geo.setIndex(box.getIndex());
+    geo.setAttribute('position', box.getAttribute('position'));
+    geo.setAttribute('normal', box.getAttribute('normal'));
+    for (const k in attrs) geo.setAttribute(k, attrs[k]);
+    geo.instanceCount = i;
+    const mat = new THREE.ShaderMaterial({
+      fog: true,
+      uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {
+        uTime: { value: 0 },
+        uBps: { value: 0.30 },              // idle tempo, nothing to do with the music
+        uSide: { value: spec.side }, uPart: { value: spec.part },
+        uMount: { value: new THREE.Vector3() },
+        uTint: { value: new THREE.Color(1, 1, 1) },
+        uBeatCol: { value: new THREE.Color(1, 0.85, 0.6) },
+        uBeat: { value: 0 }
+      }]),
+      vertexShader: DANCER_VS, fragmentShader: DANCER_FS
+    });
+    mat.uniforms.uMount.value.set(spec.mount[0], spec.mount[1], spec.mount[2]);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    residents.add(mesh);
+    residentMats.push(mat);
+  }
+  scene.add(residents);
+  residents.userData.count = i;
+}
+
+function updateResidents(t, tint) {
+  if (!residents) return;
+  for (const m of residentMats) {
+    m.uniforms.uTime.value = t;
+    m.uniforms.uTint.value.copy(tint);
+    // a soft warm lift after dark so the balconies stay readable
+    m.uniforms.uBeat.value = 0.10;
+  }
+}
+
+/* ==================== THE SATELLITE ====================
+   A craft in slow orbit above the crater, firing coloured beams out across the
+   whole island. Everything is analytic in the shader: one orbit computed on the
+   CPU per frame, the beam sweep and colour cycling done on the GPU. */
+
+let sat = null;
+
+function disposeSat() {
+  if (!sat) return;
+  sat.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(sat.group);
+  sat = null;
+}
+
+function buildSatellite() {
+  disposeSat();
+  const R = world.rave;
+  if (!R) return;
+
+  const group = new THREE.Group();
+  group.frustumCulled = false;
+  const mats = [];
+
+  const craft = new THREE.Group();
+  craft.frustumCulled = false;
+
+  // ---- body: a bright hull with a dark core so it reads against the sky ----
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(5.2, 3.2, 5.2),
+    new THREE.MeshBasicMaterial({ color: 0xd8e2ee, fog: false })
+  );
+  craft.add(body);
+  const belt = new THREE.Mesh(
+    new THREE.BoxGeometry(5.5, 0.9, 5.5),
+    new THREE.MeshBasicMaterial({ color: 0x1b2434, fog: false })
+  );
+  craft.add(belt);
+
+  // ---- solar wings ----
+  const wingMat = new THREE.ShaderMaterial({
+    fog: false, side: THREE.DoubleSide,
+    uniforms: { uTime: { value: 0 } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform float uTime; varying vec2 vUv;
+      void main(){
+        vec2 g = floor(vUv * vec2(8.0, 3.0));
+        float cell = mod(g.x + g.y, 2.0);
+        vec3 c = mix(vec3(0.10,0.16,0.38), vec3(0.20,0.34,0.72), cell);
+        c += 0.30 * pow(max(0.0, sin(uTime * 0.7 + g.x * 0.5)), 6.0);
+        gl_FragColor = vec4(c, 1.0);
+        #include <colorspace_fragment>
+      }`
+  });
+  mats.push(wingMat);
+  for (const sgn of [-1, 1]) {
+    const wing = new THREE.Mesh(new THREE.PlaneGeometry(11, 4.2), wingMat);
+    wing.position.set(sgn * 8.4, 0, 0);
+    wing.rotation.x = Math.PI / 2;
+    craft.add(wing);
+    const spar = new THREE.Mesh(
+      new THREE.BoxGeometry(3.6, 0.4, 0.4),
+      new THREE.MeshBasicMaterial({ color: 0x9fb0c2, fog: false })
+    );
+    spar.position.set(sgn * 4.2, 0, 0);
+    craft.add(spar);
+  }
+
+  // ---- dish ----
+  const dish = new THREE.Mesh(
+    new THREE.SphereGeometry(2.4, 18, 10, 0, Math.PI * 2, 0, Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0xf2f5f8, side: THREE.DoubleSide, fog: false })
+  );
+  dish.position.y = 2.2;
+  dish.rotation.x = Math.PI;
+  craft.add(dish);
+
+  // ---- the beams: a fan of long cones firing outward in every direction ----
+  const BEAMN = 12;
+  const beamMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide, fog: false,
+    uniforms: {
+      uTime: { value: 0 }, uBps: { value: RAVE_BPS },
+      uEnergy: { value: 0.5 }, uBeat: { value: 0 }, uDrop: { value: 0 }
+    },
+    vertexShader: `
+      attribute float aIdx;
+      uniform float uTime, uEnergy;
+      varying float vY, vR, vIdx;
+      mat3 rz(float a){ float c=cos(a),s=sin(a); return mat3(c,s,0., -s,c,0., 0.,0.,1.); }
+      mat3 ry(float a){ float c=cos(a),s=sin(a); return mat3(c,0.,-s, 0.,1.,0., s,0.,c); }
+      void main(){
+        vIdx = aIdx;
+        float t = uTime;
+        // each beam owns a slice of the sphere and sweeps within it
+        float yaw = aIdx * 2.399963 + t * (0.22 + uEnergy * 0.25);
+        float tilt = 1.15 + sin(t * 0.55 + aIdx * 1.7) * (0.55 + uEnergy * 0.35);
+        vec3 p = ry(yaw) * (rz(tilt) * position);
+        vY = -position.y / 150.0;
+        vR = length(position.xz) / max(0.001, 1.0 + vY * 16.0);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+      }`,
+    fragmentShader: `
+      uniform float uTime, uBps, uEnergy, uBeat, uDrop;
+      varying float vY, vR, vIdx;
+      vec3 hue(float h){
+        return clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+      }
+      void main(){
+        float radial = pow(1.0 - clamp(vR, 0.0, 1.0), 2.0);
+        float fall = pow(1.0 - clamp(vY, 0.0, 1.0), 1.2);
+        float pulse = 0.6 + 0.4 * sin(uTime * uBps * 6.2831853 * 2.0 - vY * 26.0 + vIdx);
+        // every beam a different colour, the whole set cycling
+        vec3 c = hue(fract(vIdx * 0.137 + uTime * 0.07));
+        float a = radial * fall * pulse * (0.05 + uEnergy * 0.09 + uBeat * 0.06 + uDrop * 0.16);
+        gl_FragColor = vec4(c * (1.6 + uDrop), a);
+        #include <colorspace_fragment>
+      }`
+  });
+  mats.push(beamMat);
+
+  {
+    const proto = new THREE.CylinderGeometry(0.7, 13, 150, 12, 1, true);
+    proto.translate(0, -75, 0);
+    const src = proto.attributes.position.array, si = proto.index.array;
+    const pos = [], idx = [], ai = [];
+    for (let k = 0; k < BEAMN; k++) {
+      const base = pos.length / 3;
+      for (let i2 = 0; i2 < src.length; i2++) pos.push(src[i2]);
+      for (let i2 = 0; i2 < proto.attributes.position.count; i2++) ai.push(k);
+      for (const v of si) idx.push(base + v);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('aIdx', new THREE.Float32BufferAttribute(ai, 1));
+    geo.setIndex(idx);
+    const beams = new THREE.Mesh(geo, beamMat);
+    beams.frustumCulled = false;
+    craft.add(beams);
+    proto.dispose();
+  }
+
+  // ---- a halo so it's findable from the ground ----
+  const haloMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide, fog: false,
+    uniforms: { uTime: { value: 0 }, uBeat: { value: 0 } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform float uTime, uBeat; varying vec2 vUv;
+      void main(){
+        float r = length(vUv - 0.5) * 2.0;
+        float ring = smoothstep(0.55, 0.8, r) * (1.0 - smoothstep(0.85, 1.0, r));
+        float glow = pow(1.0 - clamp(r, 0.0, 1.0), 3.0);
+        vec3 c = mix(vec3(1.0,0.8,0.35), vec3(0.4,0.9,1.0), 0.5 + 0.5 * sin(uTime * 0.5));
+        gl_FragColor = vec4(c * 1.4, (ring * 0.35 + glow * 0.30) * (0.6 + uBeat * 0.5));
+        #include <colorspace_fragment>
+      }`
+  });
+  mats.push(haloMat);
+  const halo = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), haloMat);
+  halo.frustumCulled = false;
+  craft.add(halo);
+
+  group.add(craft);
+  scene.add(group);
+  sat = {
+    group, craft, mats, halo,
+    cx: R.x, cz: R.z,
+    radius: R.rad + 120,
+    y: Math.min(MAXY - 6, R.topY + 20)
+  };
+}
+
+function updateSat(t, E) {
+  if (!sat) return;
+  const energy = E ? E.energy : 0.4, beat = E ? E.beat : 0, drop = E ? E.drop : 0;
+  for (const m of sat.mats) {
+    const u = m.uniforms;
+    if (u.uTime) u.uTime.value = t;
+    if (u.uEnergy) u.uEnergy.value = energy;
+    if (u.uBeat) u.uBeat.value = beat;
+    if (u.uDrop) u.uDrop.value = drop;
+  }
+  // slow orbit around the crater axis, with a gentle inclination
+  const a = t * 0.055;
+  sat.craft.position.set(
+    sat.cx + Math.cos(a) * sat.radius,
+    sat.y + Math.sin(a * 2.0) * 12,
+    sat.cz + Math.sin(a) * sat.radius
+  );
+  sat.craft.rotation.y = -a + Math.PI / 2;
+  sat.craft.rotation.z = Math.sin(t * 0.3) * 0.10;
+  sat.halo.lookAt(camera.position);
+}
+
+/* ==================== THE ELEVATOR CAR ====================
+   A platform running the shaft. Voxel collision cannot carry a rider on a
+   moving mesh, so the car is resolved explicitly in the player update: stand
+   inside its footprint near the deck and you are locked to it and lifted. */
+
+let lift = null;
+
+function disposeLift() {
+  if (!lift) return;
+  lift.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(lift.group);
+  lift = null;
+}
+
+function buildLift() {
+  disposeLift();
+  const R = world.rave;
+  if (!R || !R.elevator) return;
+  const EL = R.elevator;
+
+  const group = new THREE.Group();
+  group.frustumCulled = false;
+  const car = new THREE.Group();
+  car.frustumCulled = false;
+
+  const W = 5;
+  // deck
+  const deck = new THREE.Mesh(
+    new THREE.BoxGeometry(W, 0.4, W),
+    new THREE.MeshBasicMaterial({ color: 0xb08a5a, fog: true })
+  );
+  car.add(deck);
+  // rails
+  const railMat = new THREE.MeshBasicMaterial({ color: 0x6f7d90, fog: true });
+  for (const [ox, oz, rw, rd] of [[0, -W / 2, W, 0.25], [0, W / 2, W, 0.25], [-W / 2, 0, 0.25, W], [W / 2, 0, 0.25, W]]) {
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(rw, 0.22, rd), railMat);
+    bar.position.set(ox, 1.25, oz);
+    car.add(bar);
+    for (const s of [-1, 1]) {
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.22, 1.3, 0.22), railMat);
+      post.position.set(ox + (rw > rd ? s * (W / 2 - 0.2) : 0), 0.65, oz + (rd > rw ? s * (W / 2 - 0.2) : 0));
+      car.add(post);
+    }
+  }
+  // canopy + lamp
+  const canopy = new THREE.Mesh(
+    new THREE.BoxGeometry(W, 0.3, W),
+    new THREE.MeshBasicMaterial({ color: 0x2a3346, fog: true })
+  );
+  canopy.position.y = 2.9;
+  car.add(canopy);
+  const lampMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+    uniforms: { uTime: { value: 0 } },
+    vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform float uTime; varying vec2 vUv;
+      void main(){
+        float r = length(vUv - 0.5) * 2.0;
+        float a = pow(1.0 - clamp(r, 0.0, 1.0), 2.5) * (0.55 + 0.45 * sin(uTime * 3.0));
+        gl_FragColor = vec4(vec3(1.0, 0.85, 0.5) * 1.8, a);
+        #include <colorspace_fragment>
+      }`
+  });
+  const lamp = new THREE.Mesh(new THREE.PlaneGeometry(7, 7), lampMat);
+  lamp.rotation.x = -Math.PI / 2;
+  lamp.position.y = 2.6;
+  car.add(lamp);
+
+  group.add(car);
+
+  /* ---- riders: instanced figures standing on the car ---- */
+  const RIDERS = Math.max(4, Math.round(9 * Q.fx));
+  const P = [], SK = [], SH = [], PH = [], YW = [], ST = [], SC = [];
+  const skins = [0xF0C9A0, 0xD9A272, 0xB07A4E, 0x8A5A38, 0x5C3A24].map((h) => new THREE.Color(h));
+  const shirts = [0xFF3D8B, 0x2ED9E6, 0xFFD23F, 0x9B5CFF, 0x35D07F, 0xF2F5F8].map((h) => new THREE.Color(h));
+  for (let i = 0; i < RIDERS; i++) {
+    const a = (i / RIDERS) * TAU;
+    const rr = 0.6 + rnd2(i, 3, 9101) * 1.4;
+    P.push(Math.cos(a) * rr, 0.2, Math.sin(a) * rr);
+    const sk = skins[(rnd2(i, 5, 9102) * skins.length) | 0];
+    const sh = shirts[(rnd2(i, 7, 9103) * shirts.length) | 0];
+    SK.push(sk.r, sk.g, sk.b); SH.push(sh.r, sh.g, sh.b);
+    PH.push(rnd2(i, 9, 9104));
+    YW.push(a + Math.PI);
+    ST.push(rnd2(i, 11, 9105) < 0.4 ? 1 : 0);
+    SC.push(0.92 + rnd2(i, 13, 9106) * 0.18);
+  }
+  const attrs = {
+    aPos: new THREE.InstancedBufferAttribute(new Float32Array(P), 3),
+    aSkin: new THREE.InstancedBufferAttribute(new Float32Array(SK), 3),
+    aShirt: new THREE.InstancedBufferAttribute(new Float32Array(SH), 3),
+    aPhase: new THREE.InstancedBufferAttribute(new Float32Array(PH), 1),
+    aYaw: new THREE.InstancedBufferAttribute(new Float32Array(YW), 1),
+    aStyle: new THREE.InstancedBufferAttribute(new Float32Array(ST), 1),
+    aScale: new THREE.InstancedBufferAttribute(new Float32Array(SC), 1)
+  };
+  const riderMats = [];
+  for (const spec of DANCER_PARTS) {
+    const box = new THREE.BoxGeometry(spec.w, spec.h, spec.d);
+    box.translate(0, spec.cy, 0);
+    const geo = new THREE.InstancedBufferGeometry();
+    geo.setIndex(box.getIndex());
+    geo.setAttribute('position', box.getAttribute('position'));
+    geo.setAttribute('normal', box.getAttribute('normal'));
+    for (const k in attrs) geo.setAttribute(k, attrs[k]);
+    geo.instanceCount = RIDERS;
+    const mat = new THREE.ShaderMaterial({
+      fog: true,
+      uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, {
+        uTime: { value: 0 }, uBps: { value: RAVE_BPS }, uSide: { value: spec.side },
+        uPart: { value: spec.part }, uMount: { value: new THREE.Vector3() },
+        uTint: { value: new THREE.Color(1, 1, 1) },
+        uBeatCol: { value: new THREE.Color(1, 1, 1) }, uBeat: { value: 0 }
+      }]),
+      vertexShader: DANCER_VS, fragmentShader: DANCER_FS
+    });
+    mat.uniforms.uMount.value.set(spec.mount[0], spec.mount[1], spec.mount[2]);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    car.add(mesh);
+    riderMats.push(mat);
+  }
+
+  scene.add(group);
+  // with the Aerie in place the top station is its deck: the car's floor
+  // (lift.y + 0.2) must land flush with the deck surface (A.y + 1)
+  const A = world.aerie;
+  lift = {
+    group, car, lampMat, riderMats,
+    x: R.x + EL.dx + 0.5, z: R.z + EL.dz + 0.5,
+    y0: EL.y0, y1: A ? A.y + 0.8 : EL.y1,
+    y: EL.y0, dir: 1, speed: 5.2, hold: 0, half: W / 2 - 0.4, topHold: A ? 7 : 3.5
+  };
+}
+
+function updateLift(dt, t) {
+  if (!lift) return;
+  const prevY = lift.y;
+  if (lift.hold > 0) {
+    lift.hold -= dt;
+  } else {
+    lift.y += lift.dir * lift.speed * dt;
+    if (lift.y >= lift.y1) { lift.y = lift.y1; lift.dir = -1; lift.hold = lift.topHold; if (lift.riding) quest.event('lift'); }
+    if (lift.y <= lift.y0) { lift.y = lift.y0; lift.dir = 1; lift.hold = 3.5; }
+  }
+  lift.car.position.set(lift.x, lift.y, lift.z);
+  lift.lampMat.uniforms.uTime.value = t;
+  for (const m of lift.riderMats) {
+    m.uniforms.uTime.value = t;
+    m.uniforms.uTint.value.copy(dayTint);
+  }
+  lift.delta = lift.y - prevY;
+}
+
+/* Carry the player. Voxel collision knows nothing about a moving mesh, so the
+   car is resolved here: inside the footprint and near the deck means you ride. */
+function ridePlatform() {
+  if (!lift) { return false; }
+  const p = player.pos;
+  const inside = Math.abs(p.x - lift.x) <= lift.half && Math.abs(p.z - lift.z) <= lift.half;
+  if (player.fly || !inside) { lift.riding = false; return false; }
+  const deckY = lift.y + 0.2;
+  // Stateful attachment. A purely positional test drops the rider the moment
+  // the car moves further in one frame than the catch window is wide; once
+  // attached, stay attached until they step outside the footprint or jump.
+  if (!lift.riding) {
+    if (p.y > deckY + 1.4 || p.y < deckY - 1.6) return false;
+    lift.riding = true;
+  } else if (p.y > deckY + 2.6) {
+    lift.riding = false;                       // jumped clear
+    return false;
+  }
+  p.y = deckY;
+  player.vel.y = Math.max(0, player.vel.y);
+  player.onGround = true;
+  return true;
+}
+
+/* ==================== POST PIPELINE ====================
+   The scene was rendering straight to an 8-bit canvas with no tonemap, so every
+   emissive surface, neon, lanterns, lasers, the LED wall, clipped to flat
+   white the moment it went above 1.0. This renders to a half-float HDR target
+   instead, extracts the highlights, blooms them at quarter res, then tonemaps
+   and grades on the way to the screen.
+
+   Cost: 3 low-res passes plus one fullscreen composite. Everything stays in the
+   stylized lane, ACES here is a filmic response curve, not a bid for realism. */
+
+const POST = {
+  enabled: true,
+  exposure: 1.25,          // measured neutral against the un-graded pipe
+  bloomStrength: 0.62,
+  bloomThreshold: 0.72,
+  bloomKnee: 0.28,
+  grain: 0.020,
+  vignette: 0.26,
+  chroma: 0.0022
+};
+
+let post = null;
+let underAmt = 0;
+
+function makeRT(w, h, half) {
+  const rt = new THREE.WebGLRenderTarget(Math.max(2, w), Math.max(2, h), {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    type: half ? THREE.HalfFloatType : THREE.UnsignedByteType,
+    depthBuffer: false,
+    stencilBuffer: false
+  });
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  return rt;
+}
+
+const FS_QUAD_VS = `
+  varying vec2 vUv;
+  void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+
+function buildPost() {
+  if (post) disposePost();
+  const w = renderer.domElement.width, h = renderer.domElement.height;
+
+  // scene target: half-float so highlights can exceed 1.0, MSAA for clean edges
+  const sceneRT = new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    type: THREE.HalfFloatType,
+    samples: Q.msaa
+  });
+  sceneRT.texture.colorSpace = THREE.LinearSRGBColorSpace;
+
+  const bw = Math.max(2, w >> 2), bh = Math.max(2, h >> 2);
+  const brightRT = makeRT(bw, bh, true);
+  const blurRT = makeRT(bw, bh, true);
+
+  const quad = new THREE.PlaneGeometry(2, 2);
+  const scenePost = new THREE.Scene();
+  const camPost = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+  const brightMat = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: { tSrc: { value: null }, uThresh: { value: POST.bloomThreshold }, uKnee: { value: POST.bloomKnee } },
+    vertexShader: `
+      in vec3 position; in vec2 uv; out vec2 vUv;
+      void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: `
+      precision highp float;
+      in vec2 vUv; out vec4 oCol;
+      uniform sampler2D tSrc; uniform float uThresh; uniform float uKnee;
+      void main(){
+        vec3 c = texture(tSrc, vUv).rgb;
+        float l = max(c.r, max(c.g, c.b));
+        // soft knee so the bloom ramps in rather than switching on
+        float s = clamp((l - uThresh + uKnee) / (2.0 * uKnee), 0.0, 1.0);
+        float w = max(s * s * uKnee, max(l - uThresh, 0.0)) / max(l, 1e-5);
+        oCol = vec4(c * w, 1.0);
+      }`
+  });
+
+  const blurMat = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: { tSrc: { value: null }, uDir: { value: new THREE.Vector2(1, 0) }, uTexel: { value: new THREE.Vector2(1 / bw, 1 / bh) } },
+    vertexShader: `
+      in vec3 position; in vec2 uv; out vec2 vUv;
+      void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: `
+      precision highp float;
+      in vec2 vUv; out vec4 oCol;
+      uniform sampler2D tSrc; uniform vec2 uDir; uniform vec2 uTexel;
+      void main(){
+        vec2 o = uDir * uTexel;
+        vec3 c = texture(tSrc, vUv).rgb * 0.2270270270;
+        c += texture(tSrc, vUv + o * 1.3846153846).rgb * 0.3162162162;
+        c += texture(tSrc, vUv - o * 1.3846153846).rgb * 0.3162162162;
+        c += texture(tSrc, vUv + o * 3.2307692308).rgb * 0.0702702703;
+        c += texture(tSrc, vUv - o * 3.2307692308).rgb * 0.0702702703;
+        oCol = vec4(c, 1.0);
+      }`
+  });
+
+  const compMat = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: {
+      tScene: { value: null }, tBloom: { value: null },
+      uExposure: { value: POST.exposure }, uBloom: { value: POST.bloomStrength },
+      uGrain: { value: POST.grain }, uVignette: { value: POST.vignette },
+      uChroma: { value: POST.chroma }, uTime: { value: 0 }, uUnder: { value: 0 }, uAspect: { value: 1 }
+    },
+    vertexShader: `
+      in vec3 position; in vec2 uv; out vec2 vUv;
+      void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: `
+      precision highp float;
+      in vec2 vUv; out vec4 oCol;
+      uniform sampler2D tScene; uniform sampler2D tBloom;
+      uniform float uExposure, uBloom, uGrain, uVignette, uChroma, uTime, uUnder, uAspect;
+
+      // ACES filmic approximation (Narkowicz). A response curve, not a look:
+      // it rolls highlights off instead of clipping them to paper white.
+      vec3 aces(vec3 x){
+        const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+        return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+      }
+      float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+      // caustics: three drifting sine sheets folded into ridges, the classic
+      // cheap approximation of refracted sunlight on a sea floor
+      float caustic(vec2 p, float t){
+        float a = sin(p.x * 3.1 + t * 1.1) + sin(p.y * 2.7 - t * 0.9 + p.x * 0.7);
+        float b = sin((p.x + p.y) * 2.2 + t * 0.7) + sin((p.x - p.y) * 3.6 - t * 1.3);
+        float c = sin(p.x * 5.3 - t * 1.7 + sin(p.y * 2.0)) + sin(p.y * 4.7 + t * 1.2);
+        float v = 1.0 - abs(sin((a + b + c) * 0.55));
+        return pow(v, 5.0);
+      }
+
+      void main(){
+        vec2 uv = vUv;
+        // underwater: a slow refractive wobble across the frame
+        if (uUnder > 0.001) {
+          uv += vec2(sin(uv.y * 14.0 + uTime * 1.6), cos(uv.x * 12.0 - uTime * 1.3)) * 0.0035 * uUnder;
+        }
+        vec2 d = uv - 0.5;
+        float r2 = dot(d, d);
+        // lateral chromatic offset, strongest at the corners
+        vec2 off = d * uChroma * r2 * 4.0;
+        vec3 col;
+        col.r = texture(tScene, uv + off).r;
+        col.g = texture(tScene, uv).g;
+        col.b = texture(tScene, uv - off).b;
+
+        col += texture(tBloom, uv).rgb * uBloom;
+        col *= uExposure;
+        if (uUnder > 0.001) {
+          // light ripples projected over the view, a green-blue cast, and a
+          // darker frame edge; the fog in the scene does the distance work
+          vec2 cp = vec2(uv.x * uAspect, uv.y) * 5.5;
+          float ca = caustic(cp, uTime) * 0.8 + caustic(cp * 0.55 + 3.1, uTime * 0.8) * 0.5;
+          col *= 1.0 + ca * 0.55 * uUnder;
+          col = mix(col, col * vec3(0.55, 0.92, 1.05), 0.35 * uUnder);
+          col *= 1.0 - uUnder * r2 * 1.4;
+        }
+        col = aces(col);
+
+        // gentle grade: lift the shadows toward cool, warm the highlights
+        float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+        col = mix(col, col * vec3(0.94, 0.98, 1.10), (1.0 - lum) * 0.35);
+        col = mix(col, col * vec3(1.06, 1.01, 0.94), lum * 0.30);
+        col = clamp((col - 0.5) * 1.045 + 0.5, 0.0, 1.0);   // a touch of contrast
+
+        col *= 1.0 - uVignette * r2 * 1.9;
+        col += (hash(uv * 1024.0 + fract(uTime)) - 0.5) * uGrain;
+
+        // linear -> sRGB for the canvas
+        col = clamp(col, 0.0, 1.0);
+        vec3 srgb = mix(col * 12.92,
+                        1.055 * pow(max(col, 1e-5), vec3(1.0 / 2.4)) - 0.055,
+                        step(0.0031308, col));
+        oCol = vec4(srgb, 1.0);
+      }`
+  });
+
+  const mesh = new THREE.Mesh(quad, brightMat);
+  mesh.frustumCulled = false;
+  scenePost.add(mesh);
+
+  post = { sceneRT, brightRT, blurRT, scenePost, camPost, mesh, quad, brightMat, blurMat, compMat, bw, bh };
+}
+
+function disposePost() {
+  if (!post) return;
+  post.sceneRT.dispose(); post.brightRT.dispose(); post.blurRT.dispose();
+  post.quad.dispose();
+  post.brightMat.dispose(); post.blurMat.dispose(); post.compMat.dispose();
+  post = null;
+}
+
+function resizePost() {
+  if (!post) return;
+  const w = renderer.domElement.width, h = renderer.domElement.height;
+  post.sceneRT.setSize(w, h);
+  const bw = Math.max(2, w >> 2), bh = Math.max(2, h >> 2);
+  post.brightRT.setSize(bw, bh);
+  post.blurRT.setSize(bw, bh);
+  post.blurMat.uniforms.uTexel.value.set(1 / bw, 1 / bh);
+  post.bw = bw; post.bh = bh;
+}
+
+function renderPost(t) {
+  if (!post || !POST.enabled) { renderer.render(scene, camera); return; }
+  const P = post;
+
+  renderer.setRenderTarget(P.sceneRT);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  // highlights -> quarter res
+  P.mesh.material = P.brightMat;
+  P.brightMat.uniforms.tSrc.value = P.sceneRT.texture;
+  renderer.setRenderTarget(P.brightRT);
+  renderer.render(P.scenePost, P.camPost);
+
+  // separable blur, two directions
+  P.mesh.material = P.blurMat;
+  P.blurMat.uniforms.tSrc.value = P.brightRT.texture;
+  P.blurMat.uniforms.uDir.value.set(1, 0);
+  renderer.setRenderTarget(P.blurRT);
+  renderer.render(P.scenePost, P.camPost);
+
+  P.blurMat.uniforms.tSrc.value = P.blurRT.texture;
+  P.blurMat.uniforms.uDir.value.set(0, 1);
+  renderer.setRenderTarget(P.brightRT);
+  renderer.render(P.scenePost, P.camPost);
+
+  // composite to screen
+  P.mesh.material = P.compMat;
+  P.compMat.uniforms.tScene.value = P.sceneRT.texture;
+  P.compMat.uniforms.tBloom.value = P.brightRT.texture;
+  P.compMat.uniforms.uTime.value = t;
+  underAmt += ((underwater ? 1 : 0) - underAmt) * 0.25;
+  P.compMat.uniforms.uUnder.value = underAmt;
+  P.compMat.uniforms.uAspect.value = renderer.domElement.width / Math.max(1, renderer.domElement.height);
+  renderer.setRenderTarget(null);
+  renderer.render(P.scenePost, P.camPost);
+}
+
+/* ==================== WILDLIFE ====================
+   Seabirds, reef fish and fireflies, all analytic: every position is a pure
+   function of time and a per-instance seed evaluated in the vertex shader, so
+   a thousand fish cost one draw call and no CPU. The lighthouse beam is a pair
+   of long cones rotating on a timer. */
+let wild = null;
+
+function disposeWildlife() {
+  if (!wild) return;
+  wild.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  scene.remove(wild.group);
+  wild = null;
+}
+
+/* shared helpers for instanced flocks: a base geometry stamped N times with a
+   per-vertex instance index, so the vertex shader can address a per-instance
+   parameter block from plain attributes without instancing extensions */
+function stampGeometry(base, N, extra) {
+  const src = base.attributes.position.array, sn = base.attributes.normal ? base.attributes.normal.array : null;
+  const si = base.index ? base.index.array : null;
+  const vc = base.attributes.position.count;
+  const pos = new Float32Array(src.length * N), nor = sn ? new Float32Array(sn.length * N) : null;
+  const idx = [], per = {};
+  for (const k in extra) per[k] = new Float32Array(vc * N * extra[k].size);
+  for (let i = 0; i < N; i++) {
+    pos.set(src, i * src.length);
+    if (nor) nor.set(sn, i * sn.length);
+    const base2 = i * vc;
+    if (si) for (const v of si) idx.push(base2 + v); else for (let v = 0; v < vc; v++) idx.push(base2 + v);
+    for (const k in extra) {
+      const e = extra[k], vals = e.fn(i);
+      for (let v = 0; v < vc; v++) for (let c = 0; c < e.size; c++) per[k][(base2 + v) * e.size + c] = vals[c];
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  if (nor) g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  for (const k in extra) g.setAttribute(k, new THREE.BufferAttribute(per[k], extra[k].size));
+  g.setIndex(idx);
+  return g;
+}
+
+function buildWildlife() {
+  disposeWildlife();
+  const group = new THREE.Group();
+  group.frustumCulled = false;
+  const mats = [];
+  const C = world.city, R = world.rave, L = world.lighthouse, P = world.portal;
+
+  /* ---------- 1. seabirds: gulls wheeling over the reef and the canopy ---------- */
+  {
+    const N = Q.birds;
+    // a gull: two wing quads meeting at the body, flapped in the shader
+    const bird = new THREE.BufferGeometry();
+    const bp = new Float32Array([
+      0, 0, 0.55, -1.6, 0, -0.2, 0, 0, -0.45,       // left wing
+      0, 0, 0.55, 0, 0, -0.45, 1.6, 0, -0.2,        // right wing
+      0, 0.05, 0.7, -0.14, 0, -0.5, 0.14, 0, -0.5   // body sliver
+    ]);
+    bird.setAttribute('position', new THREE.BufferAttribute(bp, 3));
+    const roosts = [];
+    if (L) roosts.push({ x: L.x, z: L.z, y: SEA + 26, r: 22 });
+    if (P) roosts.push({ x: P.x, z: P.z, y: SEA + 16, r: 30 });
+    if (C) for (let i = 0; i < C.trees.length; i += 3) roosts.push({ x: C.trees[i].x, z: C.trees[i].z, y: C.trees[i].top + 14, r: 26 });
+    if (R) roosts.push({ x: R.x, z: R.z, y: R.topY + 18, r: R.rad + 30 });
+    if (!roosts.length) roosts.push({ x: 0, z: 0, y: SEA + 30, r: 40 });
+    const geo = stampGeometry(bird, N, {
+      aC: { size: 4, fn: (i) => { const r = roosts[i % roosts.length]; return [r.x + (rnd2(i, 1, 811) - 0.5) * 10, r.y + rnd2(i, 2, 812) * 12, r.z + (rnd2(i, 3, 813) - 0.5) * 10, r.r * (0.6 + rnd2(i, 4, 814) * 0.7)]; } },
+      aP: { size: 4, fn: (i) => [rnd2(i, 5, 815) * TAU, (0.10 + rnd2(i, 6, 816) * 0.08) * (rnd2(i, 7, 817) < 0.5 ? 1 : -1), 0.8 + rnd2(i, 8, 818) * 0.5, rnd2(i, 9, 819)] }
+    });
+    const m = new THREE.ShaderMaterial({
+      side: THREE.DoubleSide, fog: true,
+      uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 }, uTint: { value: new THREE.Color(1, 1, 1) } }]),
+      vertexShader: `
+        #include <common>
+        #include <fog_pars_vertex>
+        attribute vec4 aC; attribute vec4 aP;
+        uniform float uTime;
+        varying float vShade;
+        void main(){
+          float t = uTime * aP.y + aP.x;
+          // a wide circle with a slow figure-of-eight wobble and a gentle climb/dive
+          vec3 c = vec3(aC.x + cos(t) * aC.w + sin(t * 0.37) * 6.0, aC.y + sin(t * 0.6 + aP.w * 6.0) * 4.0, aC.z + sin(t) * aC.w);
+          vec3 vel = vec3(-sin(t) * aC.w * aP.y, cos(t * 0.6 + aP.w * 6.0) * 2.4 * aP.y, cos(t) * aC.w * aP.y);
+          vec3 f = normalize(vel + vec3(1e-4));
+          vec3 up = vec3(0.0, 1.0, 0.0);
+          vec3 r = normalize(cross(f, up));
+          vec3 u = cross(r, f);
+          // flap: wing tips rise and fall, gliding birds hold them still
+          float flap = sin(uTime * 9.0 * aP.z + aP.w * 20.0);
+          float glide = step(0.5, fract(uTime * 0.05 + aP.w));
+          vec3 p = position;
+          p.y += abs(p.x) * flap * mix(0.55, 0.08, glide);
+          p.z -= abs(p.x) * 0.15;
+          vec3 wpos = c + r * p.x * aP.z + u * p.y * aP.z + f * p.z * aP.z;
+          // bank into the turn
+          wpos += r * (-0.0);
+          vShade = 0.55 + 0.45 * max(dot(normalize(u + r * 0.3), normalize(vec3(0.4, 0.9, 0.3))), 0.0);
+          vec4 mvPosition = viewMatrix * vec4(wpos, 1.0);
+          gl_Position = projectionMatrix * mvPosition;
+          #include <fog_vertex>
+        }`,
+      fragmentShader: `
+        #include <common>
+        #include <fog_pars_fragment>
+        uniform vec3 uTint; varying float vShade;
+        void main(){
+          vec3 c = mix(vec3(0.16, 0.17, 0.2), vec3(0.95, 0.96, 0.98), vShade) * uTint;
+          gl_FragColor = vec4(c, 1.0);
+          #include <fog_fragment>
+          #include <colorspace_fragment>
+        }`
+    });
+    mats.push(m);
+    const mesh = new THREE.Mesh(geo, m); mesh.frustumCulled = false; group.add(mesh);
+  }
+
+  /* ---------- 2. fish: schools in the lagoon, each a slow, tight orbit ---------- */
+  {
+    const N = Q.fish;
+    // school centres: shallow water around the portal and along the reef
+    const schools = [];
+    const tryAdd = (x, z) => {
+      const c = world.column(x, z);
+      const depth = SEA - c.h;
+      if (depth >= 3 && depth <= 12) schools.push({ x, z, y: c.h + 1.5 + depth * 0.35, r: 3 + depth * 0.5, depth });
+    };
+    const cx0 = P ? P.x : (C ? C.cx : 0), cz0 = P ? P.z : (C ? C.cz : 0);
+    for (let k = 0; k < 90 && schools.length < 10; k++) {
+      const a = rnd2(k, 1, 9001) * TAU, r = 8 + rnd2(k, 2, 9002) * 120;
+      tryAdd(Math.round(cx0 + Math.cos(a) * r), Math.round(cz0 + Math.sin(a) * r));
+    }
+    if (L) for (let k = 0; k < 30 && schools.length < 14; k++) {
+      const a = rnd2(k, 3, 9003) * TAU, r = 10 + rnd2(k, 4, 9004) * 40;
+      tryAdd(Math.round(L.x + Math.cos(a) * r), Math.round(L.z + Math.sin(a) * r));
+    }
+    if (schools.length) {
+      const fish = new THREE.BoxGeometry(0.16, 0.22, 0.62);
+      const palettes = [[0.85, 0.88, 0.95], [0.2, 0.55, 0.95], [1.0, 0.75, 0.2], [0.95, 0.35, 0.25], [0.3, 0.9, 0.8]];
+      const geo = stampGeometry(fish, N, {
+        aC: { size: 4, fn: (i) => { const s = schools[i % schools.length]; return [s.x + 0.5, s.y, s.z + 0.5, s.r]; } },
+        aP: { size: 4, fn: (i) => [rnd2(i, 5, 9005) * TAU, (0.35 + rnd2(i, 6, 9006) * 0.25) * ((i % schools.length) % 2 ? 1 : -1), rnd2(i, 7, 9007), (i % schools.length) % palettes.length + rnd2(i, 8, 9008) * 0.4] },
+        aO: { size: 3, fn: (i) => [(rnd2(i, 9, 9009) - 0.5), (rnd2(i, 10, 9010) - 0.5) * 0.7, (rnd2(i, 11, 9011) - 0.5)] }
+      });
+      const m = new THREE.ShaderMaterial({
+        fog: true,
+        uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 }, uTint: { value: new THREE.Color(1, 1, 1) } }]),
+        vertexShader: `
+          #include <common>
+          #include <fog_pars_vertex>
+          attribute vec4 aC; attribute vec4 aP; attribute vec3 aO;
+          uniform float uTime;
+          varying vec3 vCol; varying float vShade;
+          void main(){
+            float t = uTime * aP.y + aP.x;
+            // the school orbits its centre; each fish holds a slot in the ball
+            // and jitters around it, tail wagging
+            float rr = aC.w * (0.35 + 0.65 * aP.z);
+            vec3 slot = vec3(cos(t) * rr, aO.y * aC.w * 0.6 + sin(t * 1.7 + aP.x) * 0.4, sin(t) * rr);
+            slot += aO * 1.2 * sin(uTime * 0.9 + aP.x * 3.0);
+            vec3 vel = vec3(-sin(t) * rr * aP.y, cos(t * 1.7 + aP.x) * 0.6, cos(t) * rr * aP.y);
+            vec3 f = normalize(vel + vec3(1e-4, 0.0, 0.0));
+            vec3 r = normalize(cross(f, vec3(0.0, 1.0, 0.0)));
+            vec3 u = cross(r, f);
+            vec3 p = position;
+            // tail wag: the rear of the box swings side to side
+            p.x += sin(uTime * 14.0 * abs(aP.y) + aP.x * 5.0) * max(0.0, -p.z) * 0.9;
+            vec3 wpos = aC.xyz + slot + r * p.x + u * p.y + f * p.z;
+            int pi = int(aP.w);
+            vec3 pal = pi == 0 ? vec3(0.85,0.88,0.95) : pi == 1 ? vec3(0.2,0.55,0.95) : pi == 2 ? vec3(1.0,0.75,0.2) : pi == 3 ? vec3(0.95,0.35,0.25) : vec3(0.3,0.9,0.8);
+            vCol = pal * (0.8 + 0.2 * fract(aP.w * 7.0));
+            vShade = 0.6 + 0.4 * max(dot(u, vec3(0.0, 1.0, 0.0)), 0.0);
+            vec4 mvPosition = viewMatrix * vec4(wpos, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            #include <fog_vertex>
+          }`,
+        fragmentShader: `
+          #include <common>
+          #include <fog_pars_fragment>
+          uniform vec3 uTint; varying vec3 vCol; varying float vShade;
+          void main(){
+            gl_FragColor = vec4(vCol * vShade * uTint * 0.9, 1.0);
+            #include <fog_fragment>
+            #include <colorspace_fragment>
+          }`
+      });
+      mats.push(m);
+      const mesh = new THREE.Mesh(geo, m); mesh.frustumCulled = false; group.add(mesh);
+      group.userData.schools = schools;
+    }
+  }
+
+  /* ---------- 3. fireflies: the canopy city after dark ---------- */
+  if (C) {
+    const N = Q.flies;
+    const pos = new Float32Array(N * 3), sd = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const t = C.trees[i % C.trees.length];
+      const dk = t.decks[i % t.decks.length];
+      const a = rnd2(i, 1, 7101) * TAU, r = 2 + rnd2(i, 2, 7102) * (dk.r + 6);
+      pos[i * 3] = t.x + Math.cos(a) * r; pos[i * 3 + 1] = dk.y + 1 + rnd2(i, 3, 7103) * 7; pos[i * 3 + 2] = t.z + Math.sin(a) * r;
+      sd[i] = rnd2(i, 4, 7104);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aSeed', new THREE.BufferAttribute(sd, 1));
+    const m = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+      uniforms: { uTime: { value: 0 }, uNight: { value: 0 } },
+      vertexShader: `
+        attribute float aSeed; uniform float uTime, uNight; varying float vA;
+        void main(){
+          float t = uTime * 0.5 + aSeed * 40.0;
+          vec3 p = position + vec3(sin(t * 1.3) * 1.6 + sin(t * 0.37) * 2.2, sin(t * 0.9 + aSeed) * 0.9, cos(t * 1.1) * 1.6 + cos(t * 0.29) * 2.2);
+          // blink: a slow pulse with a random duty
+          float blink = smoothstep(0.55, 0.9, sin(uTime * (1.2 + aSeed * 1.5) + aSeed * 30.0));
+          vA = blink * uNight;
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          gl_PointSize = 52.0 / max(1.0, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        varying float vA;
+        void main(){
+          float r = length(gl_PointCoord - 0.5);
+          float core = 1.0 - smoothstep(0.0, 0.16, r);
+          float halo = 1.0 - smoothstep(0.1, 0.5, r);
+          gl_FragColor = vec4(vec3(0.85, 1.0, 0.45) * (1.8 * core + 0.5 * halo), vA * (core + halo * 0.35));
+          #include <colorspace_fragment>
+        }`
+    });
+    mats.push(m);
+    const pts = new THREE.Points(g, m); pts.frustumCulled = false; group.add(pts);
+  }
+
+  /* ---------- 4. the lighthouse beam ---------- */
+  let beam = null;
+  if (L) {
+    const g = new THREE.CylinderGeometry(0.5, 7.5, 110, 12, 1, true);
+    g.rotateZ(Math.PI / 2); g.translate(55, 0, 0);
+    const m = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
+      uniforms: { uNight: { value: 0 } },
+      vertexShader: `varying float vX, vR; void main(){ vX = position.x / 110.0; vR = length(position.yz) / max(0.001, 0.5 + vX * 7.0); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `
+        uniform float uNight; varying float vX, vR;
+        void main(){
+          float radial = pow(1.0 - clamp(vR, 0.0, 1.0), 2.0);
+          float fall = pow(1.0 - clamp(vX, 0.0, 1.0), 1.4);
+          float a = radial * fall * (0.05 + 0.22 * uNight);
+          gl_FragColor = vec4(vec3(1.0, 0.93, 0.7) * 1.3, a);
+          #include <colorspace_fragment>
+        }`
+    });
+    mats.push(m);
+    beam = new THREE.Group();
+    for (const s of [0, Math.PI]) { const b = new THREE.Mesh(g, m); b.rotation.y = s; b.frustumCulled = false; beam.add(b); }
+    beam.position.set(L.x + 0.5, L.top - 0.5, L.z + 0.5);
+    group.add(beam);
+  }
+
+  scene.add(group);
+  wild = { group, mats, beam };
+}
+
+function updateWildlife(t, dt) {
+  if (!wild) return;
+  const night = nightAmt;
+  for (const m of wild.mats) {
+    const u = m.uniforms;
+    if (u.uTime) u.uTime.value = t;
+    if (u.uNight) u.uNight.value = night;
+    if (u.uTint) u.uTint.value.copy(dayTint);
+  }
+  if (wild.beam) wild.beam.rotation.y = t * 0.9;
+  void dt;
+}
+
+/* ==================== GAMEPAD ====================
+   Standard mapping: left stick moves, right stick looks, A jumps or opens the
+   glider, B toggles flight, X breaks, Y places, bumpers cycle the hotbar,
+   triggers mirror X/Y, Start opens the menu. Polled once a frame. */
+const pad = { prev: [], t: 0 };
+function pollGamepad(dt) {
+  const gps = navigator.getGamepads ? navigator.getGamepads() : null;
+  if (!gps) return;
+  let gp = null;
+  for (const g of gps) if (g && g.connected) { gp = g; break; }
+  if (!gp) return;
+  const dz = (v) => Math.abs(v) < 0.16 ? 0 : v;
+  const lx = dz(gp.axes[0] || 0), ly = dz(gp.axes[1] || 0), rx = dz(gp.axes[2] || 0), ry = dz(gp.axes[3] || 0);
+  touchMove.active = (lx !== 0 || ly !== 0) || (touchMove.id >= 0);
+  if (touchMove.id < 0) { touchMove.x = lx; touchMove.y = ly; }
+  player.yaw -= rx * 2.6 * dt;
+  player.pitch = clamp(player.pitch - ry * 1.8 * dt, -Math.PI / 2 + 0.02, Math.PI / 2 - 0.02);
+  const b = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+  const edge = (i) => { const now = b(i), was = !!pad.prev[i]; pad.prev[i] = now; return now && !was; };
+  keys['__jump'] = b(0) || keys['__jump'];
+  if (edge(0)) jumpPressed();
+  if (edge(1)) toggleFly();
+  keys['__down'] = b(1) && player.fly ? keys['__down'] : keys['__down'];
+  pad.t -= dt;
+  if ((b(2) || b(6)) && pad.t <= 0) { breakBlock(); pad.t = 0.22; }
+  if (edge(3) || edge(7)) placeBlock();
+  if (edge(4)) { sel = (sel + HOTBAR.length - 1) % HOTBAR.length; drawHotbar(); }
+  if (edge(5)) { sel = (sel + 1) % HOTBAR.length; drawHotbar(); }
+  if (edge(9)) setPaused(true);
+  keys['__sprint'] = b(10) || keys['__sprint'];
+  if (!b(0) && touchMove.id < 0) keys['__jump'] = false;
+  if (!b(10) && touchMove.id < 0) keys['__sprint'] = false;
+}
+
+/* ==================== EDIT PERSISTENCE ====================
+   Player edits are the only thing the seed cannot reproduce, so they are the
+   only thing worth saving. Stored per seed as a compact string, written a
+   moment after the last edit and again when the tab is hidden. */
+const edits = {
+  dirty: false, timer: 0,
+  key() { return 'edits.' + world.seed; },
+  load() {
+    const s = store.get(this.key(), null);
+    world.edits.clear();
+    if (typeof s === 'string' && s.length) {
+      for (const rec of s.split(';')) {
+        const p = rec.split(','); if (p.length !== 4) continue;
+        const x = +p[0], y = +p[1], z = +p[2], id = +p[3];
+        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) && Number.isFinite(id)) world.edits.set(x + ',' + y + ',' + z, id);
+      }
+    }
+    this.dirty = false; this.timer = 0;
+    this.info();
+  },
+  mark() { this.dirty = true; this.timer = 2.0; },
+  tick(dt) { this.timer -= dt; if (this.timer <= 0) this.flush(); },
+  flush() {
+    if (!this.dirty) return;
+    this.dirty = false;
+    const parts = [];
+    for (const [k, id] of world.edits) parts.push(k + ',' + id);
+    const ok = store.set(this.key(), parts.join(';'));
+    if (!ok && parts.length) toast('Could not save the build (storage unavailable)');
+    this.info();
+  },
+  clear() { world.edits.clear(); store.del(this.key()); this.dirty = false; this.info(); },
+  info() {
+    const el = $('saveInfo'); if (!el) return;
+    const n = world.edits.size;
+    el.textContent = n ? n + ' block edit' + (n === 1 ? '' : 's') + ' saved for seed ' + world.seed : 'no edits saved for this seed';
+  }
+};
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    edits.flush(); quest.save();
+    if (!paused) setPaused(true);
+    try { if (audio.ctx && audio.ctx.state === 'running') audio.ctx.suspend(); } catch (e) { }
+  } else {
+    try { if (audio.ctx && audio.on && audio.ctx.state === 'suspended') audio.ctx.resume(); } catch (e) { }
+  }
+});
+window.addEventListener('pagehide', () => { edits.flush(); quest.save(); saveSettings(); });
+
+/* ==================== OBJECTIVES ====================
+   A short, linear thread through the world's set pieces plus one collectible
+   count. Progress is per seed and survives a reload. */
+const QUEST_STEPS = [
+  { id: 'wake',   text: 'Wake on the Aerie' },
+  { id: 'glide',  text: 'Step off the prow and open the glider (Space)' },
+  { id: 'city',   text: 'Set foot in the Canopy City' },
+  { id: 'portal', text: 'Swim through the pink portal on the sea floor' },
+  { id: 'stage',  text: 'Reach the Mainstage DJ booth' },
+  { id: 'lift',   text: 'Ride the elevator back up to the Aerie' },
+  { id: 'tour',   text: 'Visit every district of the rave', count: true }
+];
+const quest = {
+  done: {}, visited: {}, stageT: 0, total: 0,
+  key() { return 'quest.' + world.seed; },
+  load() {
+    const s = store.get(this.key(), null);
+    this.done = (s && s.done) || {}; this.visited = (s && s.visited) || {};
+    this.total = world.rave ? world.rave.tiers.length : 0;
+    this.done.wake = true;
+    this.render();
+  },
+  save() { store.set(this.key(), { done: this.done, visited: this.visited }); },
+  event(id) {
+    if (this.done[id]) return;
+    this.done[id] = true; this.save(); this.render();
+    const step = QUEST_STEPS.find((s) => s.id === id);
+    if (step) { toast('✓ ' + step.text); try { audio.chime(); } catch (e) { } }
+  },
+  visit(key) {
+    if (!key || this.visited[key]) return;
+    this.visited[key] = true;
+    const n = Object.keys(this.visited).length;
+    this.save(); this.render();
+    if (n >= this.total && this.total) this.event('tour');
+    else toast('District ' + n + ' / ' + this.total);
+  },
+  current() { return QUEST_STEPS.find((s) => !this.done[s.id]); },
+  render() {
+    const ol = $('questList'); if (!ol) return;
+    const cur = this.current();
+    ol.innerHTML = '';
+    for (const s of QUEST_STEPS) {
+      const li = document.createElement('li');
+      li.className = this.done[s.id] ? 'done' : (cur && cur.id === s.id ? 'now' : '');
+      const k = document.createElement('span'); k.className = 'k'; k.textContent = '✓';
+      const t = document.createElement('span'); t.textContent = s.text;
+      li.appendChild(k); li.appendChild(t);
+      if (s.count) { const p = document.createElement('span'); p.className = 'p'; p.textContent = Object.keys(this.visited).length + '/' + this.total; li.appendChild(p); }
+      ol.appendChild(li);
+    }
+    objLineHtml = cur ? '<b>▸</b> ' + cur.text : '<b>✓</b> All objectives complete';
+  }
+};
+let objLineHtml = '';
+
+/* ==================== COMPASS + MINIMAP ====================
+   The compass is a bearing strip: cardinal points slide as you turn and the
+   landmarks ride along it with their distances. The minimap is a coarse
+   height/biome field sampled from the terrain function around the player,
+   refreshed a few rows per frame so it costs nothing you can measure. */
+const LANDMARKS = [
+  { key: 'portal', glyph: '◆', color: '#ff5fb0', name: 'Portal', get() { const P = world.portal; return P ? { x: P.x, z: P.z, y: P.floor + 3 } : null; } },
+  { key: 'rave',   glyph: '♪', color: '#ff2f8e', name: 'Rave',   get() { const R = world.rave; return R ? { x: R.x, z: R.z, y: R.floorY } : null; } },
+  { key: 'city',   glyph: '✿', color: '#35d07f', name: 'City',   get() { const C = world.city; return C ? { x: C.cx, z: C.cz, y: SEA + 40 } : null; } },
+  { key: 'aerie',  glyph: '▲', color: '#22d3ee', name: 'Aerie',  get() { const A = world.aerie; return A ? { x: A.x, z: A.z, y: A.y } : null; } },
+  { key: 'light',  glyph: '✦', color: '#ffd23f', name: 'Light',  get() { const L = world.lighthouse; return L ? { x: L.x, z: L.z, y: L.top } : null; } }
+];
+const compass = {
+  cv: null, g: null,
+  init() { this.cv = $('compassCv'); this.g = this.cv ? this.cv.getContext('2d') : null; },
+  draw() {
+    const g = this.g; if (!g) return;
+    const W = this.cv.width, H = this.cv.height;
+    g.clearRect(0, 0, W, H);
+    // heading and right vectors in world xz (right = strafe direction, D key)
+    const fx = -Math.sin(player.yaw), fz = -Math.cos(player.yaw);
+    const rx = Math.cos(player.yaw), rz = -Math.sin(player.yaw);
+    const pxPerRad = W / (Math.PI * 1.1);                 // ~200 degrees across the strip
+    const bearing = (dx, dz) => Math.atan2(dx * rx + dz * rz, dx * fx + dz * fz);   // + = to the right
+    g.font = '600 20px ui-monospace, Menlo, monospace'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    // ticks + cardinals: north is -z, so its world vector is (0,-1)
+    const cards = [['N', 0, -1], ['E', 1, 0], ['S', 0, 1], ['W', -1, 0]];
+    for (let i = 0; i < 16; i++) {
+      const a = i * TAU / 16;
+      const b = bearing(Math.sin(a), -Math.cos(a));
+      if (Math.abs(b) > Math.PI * 0.55) continue;
+      const x = W / 2 + b * pxPerRad;
+      g.fillStyle = i % 4 === 0 ? 'rgba(232,238,245,.7)' : 'rgba(232,238,245,.28)';
+      g.fillRect(x - 1, H - (i % 4 === 0 ? 16 : 9), 2, i % 4 === 0 ? 16 : 9);
+    }
+    for (const [n, dx, dz] of cards) {
+      const b = bearing(dx, dz);
+      if (Math.abs(b) > Math.PI * 0.55) continue;
+      const x = W / 2 + b * pxPerRad;
+      const fade = 1 - Math.pow(Math.abs(b) / (Math.PI * 0.55), 3);
+      g.fillStyle = n === 'N' ? `rgba(212,161,56,${fade})` : `rgba(232,238,245,${0.8 * fade})`;
+      g.fillText(n, x, 20);
+    }
+    // landmarks
+    g.font = '600 22px -apple-system, Helvetica, Arial, sans-serif';
+    let nearest = null;
+    for (const L of LANDMARKS) {
+      const p = L.get(); if (!p) continue;
+      const dx = p.x - player.pos.x, dz = p.z - player.pos.z;
+      const dist = Math.hypot(dx, dz);
+      const b = bearing(dx, dz);
+      if (Math.abs(b) > Math.PI * 0.55) continue;
+      const x = W / 2 + b * pxPerRad;
+      const fade = 1 - Math.pow(Math.abs(b) / (Math.PI * 0.55), 3);
+      g.globalAlpha = 0.35 + 0.65 * fade;
+      g.fillStyle = L.color;
+      g.fillText(L.glyph, x, 44);
+      g.globalAlpha = 1;
+      if (Math.abs(b) < 0.25 && (!nearest || dist < nearest.dist)) nearest = { L, dist, x, dy: p.y - player.pos.y };
+    }
+    if (nearest) {
+      g.font = '600 15px ui-monospace, Menlo, monospace';
+      g.fillStyle = nearest.L.color;
+      const dy = Math.round(nearest.dy);
+      g.fillText(nearest.L.name + ' ' + Math.round(nearest.dist) + 'm' + (Math.abs(dy) > 4 ? (dy > 0 ? ' ↑' : ' ↓') + Math.abs(dy) : ''), W / 2, 62);
+    }
+    // centre mark
+    g.fillStyle = 'rgba(255,255,255,.9)';
+    g.fillRect(W / 2 - 1, 0, 2, 8);
+  }
+};
+
+const minimap = {
+  cv: null, g: null, N: 44, cell: 4, img: null, buf: null, cx: 0, cz: 0, row: 0, dirty: true, off: null, og: null,
+  init() {
+    this.cv = $('mapCv'); if (!this.cv) return;
+    this.g = this.cv.getContext('2d');
+    this.off = document.createElement('canvas'); this.off.width = this.off.height = this.N;
+    this.og = this.off.getContext('2d');
+    this.img = this.og.createImageData(this.N, this.N);
+    this.buf = this.img.data;
+    this.cx = Math.round(player.pos.x); this.cz = Math.round(player.pos.z); this.row = 0;
+  },
+  colour(c, out) {
+    const h = c.h, land = c.land;
+    let r, g, b;
+    if (h < SEA - 9) { r = 22; g = 58; b = 108; }
+    else if (h < SEA - 2) { const t = (h - (SEA - 9)) / 7; r = 30 + t * 30; g = 100 + t * 60; b = 150 + t * 30; }
+    else if (h < SEA) { r = 92; g = 196; b = 190; }
+    else if (h < SEA + 3) { r = 226; g = 208; b = 168; }
+    else if (h < SEA + 19) { const t = (h - SEA - 3) / 16; r = 86 - t * 30; g = 148 - t * 40; b = 74 - t * 20; }
+    else { const t = clamp((h - SEA - 19) / 20, 0, 1); r = 90 + t * 60; g = 88 + t * 60; b = 92 + t * 60; }
+    if (c.band > 0.5 && h < SEA) { r = 120; g = 190; b = 170; }
+    void land;
+    out[0] = r; out[1] = g; out[2] = b;
+  },
+  update() {
+    if (!this.g) return;
+    const N = this.N, cs = this.cell;
+    if (Math.abs(player.pos.x - this.cx) > cs * 5 || Math.abs(player.pos.z - this.cz) > cs * 5) {
+      this.cx = Math.round(player.pos.x); this.cz = Math.round(player.pos.z); this.row = 0;
+    }
+    // refresh 5 rows per frame: a full sweep every ~9 frames
+    const tmp = [0, 0, 0];
+    for (let k = 0; k < 5 && this.row < N; k++, this.row++) {
+      const z = this.cz + (this.row - N / 2) * cs;
+      for (let i = 0; i < N; i++) {
+        const x = this.cx + (i - N / 2) * cs;
+        this.colour(world.column(x, z), tmp);
+        const o = (this.row * N + i) * 4;
+        this.buf[o] = tmp[0]; this.buf[o + 1] = tmp[1]; this.buf[o + 2] = tmp[2]; this.buf[o + 3] = 255;
+      }
+    }
+    if (this.row >= N) this.row = 0;
+    this.og.putImageData(this.img, 0, 0);
+  },
+  draw() {
+    const g = this.g; if (!g) return;
+    const W = this.cv.width, H = this.cv.height, N = this.N, cs = this.cell;
+    const scale = W / (N * cs);                       // px per block
+    g.save();
+    g.imageSmoothingEnabled = false;
+    g.clearRect(0, 0, W, H);
+    // north up: the field is already axis aligned, shift for the player's sub-cell offset
+    const ox = (player.pos.x - this.cx) * scale, oz = (player.pos.z - this.cz) * scale;
+    g.drawImage(this.off, 0, 0, N, N, -ox, -oz, W, H);
+    // landmarks
+    g.font = '600 12px -apple-system, Helvetica, Arial, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (const L of LANDMARKS) {
+      const p = L.get(); if (!p) continue;
+      let mx = W / 2 + (p.x - player.pos.x) * scale, mz = H / 2 + (p.z - player.pos.z) * scale;
+      const inside = mx > 6 && mx < W - 6 && mz > 6 && mz < H - 6;
+      if (!inside) {                                  // pin to the edge with a fade
+        const dx = mx - W / 2, dz = mz - H / 2, m = Math.max(Math.abs(dx) / (W / 2 - 8), Math.abs(dz) / (H / 2 - 8));
+        mx = W / 2 + dx / m; mz = H / 2 + dz / m; g.globalAlpha = 0.55;
+      }
+      g.fillStyle = L.color; g.fillText(L.glyph, mx, mz);
+      g.globalAlpha = 1;
+    }
+    // the city ring: every greatwood as a dot
+    const C = world.city;
+    if (C) { g.fillStyle = 'rgba(53,208,127,.8)'; for (const t of C.trees) { const mx = W / 2 + (t.x - player.pos.x) * scale, mz = H / 2 + (t.z - player.pos.z) * scale; if (mx > 2 && mx < W - 2 && mz > 2 && mz < H - 2) g.fillRect(mx - 1, mz - 1, 2, 2); } }
+    // player: a heading triangle
+    const fx = -Math.sin(player.yaw), fz = -Math.cos(player.yaw);
+    g.translate(W / 2, H / 2); g.rotate(Math.atan2(fx, -fz));
+    g.fillStyle = '#fff'; g.strokeStyle = 'rgba(0,0,0,.7)'; g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(0, -7); g.lineTo(5, 6); g.lineTo(0, 3); g.lineTo(-5, 6); g.closePath(); g.fill(); g.stroke();
+    g.restore();
+    // frame
+    g.strokeStyle = 'rgba(212,161,56,.45)'; g.lineWidth = 1; g.strokeRect(0.5, 0.5, W - 1, H - 1);
+  }
+};
+function setNavUI(on) {
+  for (const id of ['compass', 'right']) { const el = $(id); if (el) el.style.display = on ? '' : 'none'; }
+}
+
+/* ==================== main loop ==================== */
+let underwater = false;
+let lastEnergy = null;
+let shotReq = false;
+let last = performance.now(), acc = 0, frames = 0, fps = 0, fpsClock = performance.now();
+
+function resize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setPixelRatio(effectiveDPR());
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  resizePost();
+}
+window.addEventListener('resize', resize);
+
+/* Adaptive resolution: sample real frame time over a window; if the window
+   ran long, step the resolution down; if it ran short with headroom, step it
+   back up. Only in Auto quality, and never while paused or loading. */
+const adapt = { acc: 0, n: 0, cool: 0 };
+function adaptQuality(rawDt) {
+  if (settings.quality !== 'auto' || TESTMODE || paused) return;
+  adapt.acc += rawDt; adapt.n++;
+  if (adapt.n < 45) return;
+  const avg = adapt.acc / adapt.n; adapt.acc = 0; adapt.n = 0;
+  if (adapt.cool > 0) { adapt.cool--; return; }
+  let next = dprScale;
+  if (avg > 1 / 40) next = Math.max(0.55, dprScale - 0.1);
+  else if (avg < 1 / 75 && dprScale < 1) next = Math.min(1, dprScale + 0.05);
+  if (next !== dprScale) { dprScale = next; adapt.cool = 2; resize(); }
+}
+
+const uwFog = new THREE.Color(0x1c5c78);
+const WHITE1 = new THREE.Color(1, 1, 1);
+let stageNear = 0, hudTick = 0;
+const stageEl = $('stats');
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const rawDt = (now - last) / 1000; last = now;
+  let dt = Math.min(rawDt, 0.05);
+  adaptQuality(rawDt);
+
+  if (cycle && !paused) timeOfDay = (timeOfDay + dt / 600) % 1;
+
+  if (!paused) {
+    const headWater = updatePlayer(dt);
+    underwater = headWater;
+    if (mineHold) { mineTimer -= dt; if (mineTimer <= 0) { breakBlock(); mineTimer = 0.22; } }
+    pollGamepad(dt);
+  }
+
+  if (!paused) checkPortal(dt);
+
+  const tSec = now * 0.001;
+  updateUFOs(tSec, lastEnergy);
+  updateSat(tSec, lastEnergy);
+  if (!paused) updateLift(dt, tSec);
+  updateResidents(tSec, dayTint);
+  updateWildlife(tSec, dt);
+  if (portalFxMat) portalFxMat.uniforms.uTime.value = tSec;
+  if (guide) {
+    const P = world.portal;
+    const dToPortal = P ? Math.hypot(player.pos.x - P.x, player.pos.z - P.z) : 1e9;
+    guide.mat.uniforms.uTime.value = tSec;
+    guide.mat.uniforms.uPlayer.value.set(player.pos.x, player.pos.y, player.pos.z);
+    const want = portalArmed ? clamp((dToPortal - 8) / 26, 0, 1) : 0;
+    const cur = guide.mat.uniforms.uFade.value;
+    guide.mat.uniforms.uFade.value = cur + (want - cur) * Math.min(1, dt * 3);
+    guide.mesh.visible = guide.mat.uniforms.uFade.value > 0.02;
+  }
+
+  updateSky();
+  skyMat.uniforms.uTime.value = tSec;
+
+  if (underwater) {
+    fog.color.copy(uwFog); fog.near = 1.5; fog.far = 52; rdEff = renderDist;
+  } else {
+    // thinner haze at altitude: from the Aerie and the Overlook the edge of the
+    // loaded world is sea and sky, so the fog can stand further back
+    const hi = smoothstep(SEA + 40, SEA + 150, camera.position.y);
+    rdEff = clamp(Math.round(renderDist + hi * 4), 3, 13);
+    fog.near = rdEff * CS * (0.45 + hi * 0.55); fog.far = rdEff * CS * (1.02 + hi * 0.55);
+  }
+
+  skyDome.position.copy(camera.position);
+  clouds.position.x = camera.position.x; clouds.position.z = camera.position.z;
+  cirrus.position.x = camera.position.x; cirrus.position.z = camera.position.z;
+  cloudMat.map.offset.x = (now * 0.0000075) % 1;
+  cloudMat.map.offset.y = (now * 0.0000042) % 1;
+  cirrusTex.offset.x = (now * 0.0000031) % 1;
+  cirrusTex.offset.y = (now * 0.0000058) % 1;
+  waterUniforms.uTime.value = tSec;
+
+  // ---- the rave ----
+  let raveDist = 1e9;
+  if (raveSite && raveGroup) {
+    raveDist = Math.hypot(player.pos.x - raveSite.x, player.pos.z - raveSite.z);
+    const near = raveDist < 300;
+    raveGroup.visible = near;
+    if (near) {
+      const raveT = audio.ctx ? audio.ctx.currentTime : tSec;
+      const E = updateFX(raveT, raveDist);
+      lastEnergy = E;
+      const beat = E ? E.beat : Math.pow(1 - ((raveT * RAVE_BPS) % 1), 3);
+      const energy = E ? E.energy : 0.5;
+      const dropAmt = E ? E.drop : 0;
+      beatCol.setHSL((raveT * 0.11) % 1, 0.85, 0.56);
+      for (const m of raveParts) {
+        m.uniforms.uTime.value = raveT;
+        m.uniforms.uBeat.value = beat + dropAmt * 0.9;
+        m.uniforms.uTint.value.copy(dayTint).lerp(WHITE1, 0.35);
+        m.uniforms.uBeatCol.value.copy(beatCol);
+      }
+      if (raveFloorMat) raveFloorMat.uniforms.uTime.value = raveT;
+      const rigOn = raveDist < 165;
+      if (raveFloorMesh) raveFloorMesh.visible = rigOn;
+      if (raveBanner) {
+        raveBanner.rotation.z = Math.sin(raveT * 0.42) * 0.016;
+        if (raveBannerGlow) {
+          raveBannerGlow.rotation.z = raveBanner.rotation.z;
+          raveBannerGlow.material.opacity = 0.10 + beat * 0.30 + dropAmt * 0.45;
+        }
+      }
+      for (let k = 0; k < raveCones.length; k++) {
+        const c = raveCones[k];
+        c.visible = rigOn;
+        c.rotation.z = Math.sin(raveT * 0.68 + k * 1.13) * 0.8;
+        c.rotation.x = 0.30 + Math.sin(raveT * 0.47 + k * 0.71) * 0.28;
+        c.material.opacity = 0.06 + beat * 0.13;
+      }
+      void energy;
+    }
+    if (!near && fx && fx.flash) fx.flash.visible = false;   // never leave the strobe stuck on
+    audio.setDistance(raveDist);
+  }
+  if (!lastEnergy || raveDist >= 300) {
+    const rt2 = audio.ctx ? audio.ctx.currentTime : tSec;
+    lastEnergy = raveEnergy(rt2 * RAVE_BPS);
+  }
+  audio.setAmbience(dt);
+
+  updateChunks(player.pos.x, player.pos.z);
+  pumpQueues(paused ? 12 : 7);
+  if (!paused && edits.dirty) edits.tick(dt);
+
+  const h = paused ? null : pick(6.5);
+  if (h) { selBox.visible = true; selBox.position.set(h.x + 0.5, h.y + 0.5, h.z + 0.5); }
+  else selBox.visible = false;
+
+  if (flashT > 0) { flashT -= dt; selBox.material.opacity = 0.85 + Math.sin(flashT * 60) * 0.15; }
+
+  if (transitFlash > 0 && fx && fx.flash) {
+    fx.flash.visible = true;
+    fx.flashMat.opacity = Math.min(settings.strobe ? 0.85 : 0.35, transitFlash * 0.85);
+    fx.flashMat.color.setRGB(1, 0.55, 0.85);
+  } else if (fx && fx.flashMat) {
+    fx.flashMat.color.setRGB(1, 1, 1);
+  }
+
+  renderPost(tSec);
+
+  if (shotReq) {
+    shotReq = false;
+    try {
+      const url = renderer.domElement.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url; a.download = 'atoll_seed_' + world.seed + '.png'; a.click();
+      toast('Screenshot saved');
+    } catch (err) { toast('Screenshot blocked by browser'); }
+  }
+
+  // keep the capture hint truthful even when the lock is lost without an event
+  if (!isTouch) {
+    const want = !paused && document.pointerLockElement !== canvas;
+    const el = $('lockHint');
+    if (el && (el.style.display === 'block') !== want) el.style.display = want ? 'block' : 'none';
+  }
+
+  // ---- HUD ----
+  // measured against wall time, not the simulation's clamped dt, so heavy
+  // chunk-load frames report honestly instead of reading zero
+  frames++; acc = (now - fpsClock) / 1000;
+  if (acc >= 0.5) { fps = Math.round(frames / acc); frames = 0; fpsClock = now; }
+  if (toastT > 0) { toastT -= dt; $('toast').style.opacity = Math.min(1, toastT); }
+  else $('toast').style.opacity = 0;
+
+  // falling with nothing under you: say how to open the wings, once per fall
+  const falling = !paused && !player.fly && !player.glide && !player.inWater && !player.onGround && player.airTime > 0.7 && player.vel.y < -9;
+  $('glideHint').style.opacity = falling ? 1 : 0;
+  $('vign').style.opacity = player.glideT * 0.9;
+
+  if (settings.map) {
+    minimap.update();
+    if ((hudTick++ & 1) === 0) { compass.draw(); minimap.draw(); }
+  }
+
+  const depth = SEA - player.pos.y;
+  let zone = player.pos.y > SEA + 14 ? 'Volcanic ridge'
+    : depth > 6 ? 'Deep water' : depth > 0 ? 'Lagoon / reef'
+      : player.pos.y < SEA + 3 ? 'Beach' : 'Island interior';
+  let cue = '';
+  const PP = world.portal;
+  if (PP && portalArmed) {
+    const pd = Math.hypot(player.pos.x - PP.x, player.pos.z - PP.z);
+    const pc = bearingName(PP.x - player.pos.x, PP.z - player.pos.z);
+    const dy = Math.round(player.pos.y - (PP.floor + 4));
+    cue += ' &nbsp;&middot;&nbsp; <b class="cue">&#10148; PORTAL ' + Math.round(pd) + 'm ' + pc + (dy > 3 ? ' &darr;' + dy : '') + '</b>';
+  }
+  const AE = world.aerie;
+  if (AE && Math.hypot(player.pos.x - AE.x, player.pos.z - AE.z) < AE.r + AE.prowLen + 2 && player.pos.y > AE.y - 12) {
+    zone = 'THE AERIE';
+  }
+  const LH = world.lighthouse;
+  if (LH && Math.hypot(player.pos.x - LH.x, player.pos.z - LH.z) < 9 && player.pos.y > SEA - 2) zone = 'REEF LIGHT';
+  const CT = world.city;
+  if (CT && zone !== 'THE AERIE') {
+    for (let i = 0; i < CT.trees.length; i++) {
+      const t = CT.trees[i];
+      if (Math.hypot(player.pos.x - t.x, player.pos.z - t.z) < t.reach + 4 &&
+        player.pos.y > t.base + 6 && player.pos.y < t.top + 14) { zone = 'CANOPY CITY'; if (player.onGround && !paused) quest.event('city'); break; }
+    }
+  }
+  if (raveSite) {
+    const inBowl = raveDist < raveSite.rad + 3 &&
+      player.pos.y > raveSite.floorY - 6 && player.pos.y < raveSite.floorY + 28;
+    if (inBowl) {
+      zone = 'THE SECRET RAVE';
+      const TS = raveSite.tiers;
+      const SPz = raveSite.ship;
+      if (SPz && Math.abs(player.pos.z - SPz.z) <= SPz.L + 1 &&
+          Math.abs(player.pos.x - SPz.x) <= SPz.B + 2 && player.pos.y > SPz.keel) {
+        zone = 'THE GALLEON';
+      } else if (TS) {
+        // ring districts only apply out at the wall; rooms and the floor are central.
+        // Naming by height alone put people on the ship in "Water Walk".
+        let best = null, bd = 1e9;
+        for (const TR of TS) {
+          if (TR.kind === 'ring' && raveDist < raveSite.rad - 9) continue;
+          if (TR.kind === 'room' && raveDist > raveSite.inner) continue;
+          const dy = Math.abs(player.pos.y - (TR.y + 1.5));
+          if (dy < bd) { bd = dy; best = TR; }
+        }
+        if (best && bd < 8) { zone = best.name.toUpperCase(); if (!paused && player.onGround) quest.visit(best.key); }
+      }
+      // the DJ booth: stand near it for a moment
+      const bx = raveSite.x, bz = raveSite.z + raveSite.deckZ;
+      if (Math.hypot(player.pos.x - bx, player.pos.z - bz) < 9 && Math.abs(player.pos.y - raveSite.stageTop) < 8) {
+        stageNear += dt; if (stageNear > 1.5) quest.event('stage');
+      } else stageNear = 0;
+    }
+    else if (raveDist < 260 && !AE) {
+      cue = ` &nbsp;·&nbsp; <b>&#9834; ${Math.round(raveDist)}m ${bearingName(raveSite.x - player.pos.x, raveSite.z - player.pos.z)}</b>`;
+    }
+  }
+  // above the rings: which deck is under you
+  if (zone === 'Volcanic ridge' && raveSite && raveDist < raveSite.rad + 6 && player.pos.y >= raveSite.floorY + 28) zone = 'ABOVE THE RAVE';
+  const mode = player.fly ? 'FLY' : (player.glide ? 'GLIDE' : (player.inWater ? 'SWIM' : (player.onGround ? 'WALK' : 'AIR')));
+  const alt = Math.round(player.pos.y - SEA);
+  stageEl.innerHTML =
+    `<b>${fps}</b> fps &nbsp;·&nbsp; XYZ <b>${player.pos.x.toFixed(0)} ${player.pos.y.toFixed(0)} ${player.pos.z.toFixed(0)}</b>` +
+    ` &nbsp;·&nbsp; alt <b>${alt >= 0 ? '+' + alt : alt}</b> &nbsp;·&nbsp; <span class="zone">${zone}</span> &nbsp;·&nbsp; chunks <b>${built.size}</b>` +
+    ` &nbsp;·&nbsp; ${mode}` + cue + (dprScale < 0.999 ? ` &nbsp;·&nbsp; <span style="color:#7d8ea1">res ${Math.round(dprScale * 100)}%</span>` : '') +
+    `<div id="objLine">${objLineHtml}</div>`;
+}
+
+/* ==================== menu wiring ==================== */
+/* Everything that depends on the world, built in one place so a reseed and a
+   quality change rebuild exactly the same set. */
+function buildSetPieces() {
+  buildRave();
+  buildGuide();
+  buildUFOs();
+  buildSatellite();
+  buildLift();
+  buildResidents();
+  buildWildlife();
+}
+function setHashSeed() {
+  const keep = [];
+  if (settings.quality !== 'auto') keep.push('q=' + settings.quality);
+  if (TESTMODE) keep.push('test=1');
+  history.replaceState(null, '', '#seed=' + world.seed + (keep.length ? '&' + keep.join('&') : ''));
+}
+function newWorld(s) {
+  edits.flush(); quest.save();
+  for (const k of Array.from(built.keys())) disposeChunkMeshes(k);
+  world = new World(s >>> 0);
+  seed = world.seed;
+  $('seedIn').value = seed;
+  setHashSeed();
+  edits.load();
+  spawn();
+  player.vel.set(0, 0, 0);
+  warmup(1400);
+  portalArmed = true; portalCooldown = 0;
+  buildSetPieces();
+  quest.load();
+  minimap.init();
+  toast('World ' + seed);
+}
+function applyQuality() {
+  Q = resolveQuality();
+  POST.enabled = Q.post && settings.gfx;
+  $('gfx').checked = POST.enabled;
+  dprScale = 1; resize();
+  if (!Number.isFinite(settings.renderDist) || !settings.renderDist) { renderDist = Q.rd; $('rd').value = renderDist; $('rdv').textContent = renderDist; }
+  buildPost();
+  buildSetPieces();
+}
+
+$('btnPlay').addEventListener('click', () => setPaused(false));
+$('btnNew').addEventListener('click', () => newWorld((Math.random() * 0xffffffff) >>> 0));
+$('btnSeed').addEventListener('click', () => {
+  const v = parseInt($('seedIn').value, 10);
+  newWorld(Number.isFinite(v) ? v : (Math.random() * 0xffffffff) >>> 0);
+});
+$('btnShot').addEventListener('click', () => { shotReq = true; setPaused(false); });
+function placeCamera() {
+  camera.position.set(player.pos.x, player.pos.y + player.EYE, player.pos.z);
+  camera.rotation.set(player.pitch, player.yaw, 0, 'YXZ');
+  player.roll = 0; player.glide = false; player.airTime = 0; lastYaw = player.yaw;
+}
+function gotoRave() {
+  const R = world.rave; if (!R) return;
+  const d = R.rad - 3.5;
+  const tier = d <= R.inner ? 0 : Math.floor((d - R.inner) / 2.6) + 1;
+  player.pos.set(R.x + 0.5, R.floorY + tier * 2 + 1.2, R.z + d);
+  player.vel.set(0, 0, 0);
+  // face the stage across the bowl
+  player.yaw = faceYaw(player.pos.x, player.pos.z, R.x, R.z + R.stageZ0); player.pitch = -0.07;
+  placeCamera();
+  warmup(900);
+  setPaused(false);
+  toast('The Secret Rave');
+}
+function gotoAerie() {
+  const A = world.aerie; if (!A) { toast('No Aerie on this seed'); return; }
+  spawn();
+  placeCamera();
+  warmup(900);
+  setPaused(false);
+  toast('The Aerie: walk to the prow, step off, press Space');
+  if (typeof syncFlyUI === 'function') syncFlyUI();
+}
+/* THE OVERLOOK, hang in the air off the crater rim with the whole stack in
+   frame. Flight is switched on so you can simply drop into whichever district
+   you like; the HUD names the level you are looking at. */
+function gotoOverlook() {
+  const R = world.rave; if (!R) return;
+  // Frame the WHOLE stack: pull back until the tallest and deepest districts
+  // both sit inside the camera's vertical field of view, with margin.
+  const ys = R.tiers.map((t) => t.y);
+  const lo = Math.min(...ys), hi = Math.max(...ys) + 8;
+  const half = (hi - lo) / 2;
+  const fovHalf = THREE.MathUtils.degToRad(camera.fov * 0.5) * 0.82;   // 18% margin
+  const dist = Math.max(R.rad + 40, half / Math.tan(fovHalf));
+  const y = (lo + hi) / 2;
+  player.pos.set(R.x + 0.5, y, R.z + dist);
+  player.vel.set(0, 0, 0);
+  player.fly = true;
+  player.yaw = faceYaw(player.pos.x, player.pos.z, R.x, R.z);   // look into the bowl
+  player.pitch = 0;
+  placeCamera();
+  warmup(900);
+  setPaused(false);
+  if (typeof syncFlyUI === 'function') syncFlyUI();
+  toast('The Overlook: ' + R.tiers.length + ' levels, fly into any of them');
+}
+$('gfx').addEventListener('change', (e) => {
+  POST.enabled = e.target.checked; settings.gfx = POST.enabled; saveSettings();
+  toast(POST.enabled ? 'Enhanced graphics' : 'Standard graphics');
+});
+function gotoCity() {
+  const C = world.city;
+  if (!C) { toast('No canopy city on this seed'); return; }
+  const t = C.trees[0], d = t.decks[0];
+  const a = t.ang + Math.PI;
+  player.pos.set(t.x + Math.cos(a) * (d.r - 2) + 0.5, d.y + 1.2, t.z + Math.sin(a) * (d.r - 2) + 0.5);
+  player.vel.set(0, 0, 0);
+  // look out from the deck toward the crater and its bridges
+  const R = world.rave;
+  player.yaw = R ? faceYaw(player.pos.x, player.pos.z, R.x, R.z) : t.ang;
+  player.pitch = -0.05;
+  placeCamera();
+  warmup(1100);
+  setPaused(false);
+  toast('Canopy City');
+}
+$('btnOverlook').addEventListener('click', gotoOverlook);
+$('btnRave').addEventListener('click', gotoRave);
+$('btnAerie').addEventListener('click', gotoAerie);
+$('btnCity').addEventListener('click', gotoCity);
+$('mus').addEventListener('change', (e) => {
+  audio.on = e.target.checked; settings.sound = audio.on; saveSettings();
+  if (audio.on) audio.init();
+  toast(audio.on ? 'Sound on' : 'Sound off');
+});
+$('strobe').addEventListener('change', (e) => { settings.strobe = e.target.checked; saveSettings(); toast(settings.strobe ? 'Strobes on' : 'Strobes off'); });
+$('mapOn').addEventListener('change', (e) => { settings.map = e.target.checked; saveSettings(); setNavUI(settings.map); });
+$('qual').addEventListener('change', (e) => {
+  settings.quality = e.target.value; saveSettings();
+  applyQuality();
+  toast('Quality: ' + (settings.quality === 'auto' ? 'Auto' : QP[settings.quality].label));
+});
+$('btnClearSave').addEventListener('click', () => {
+  edits.clear();
+  for (const k of Array.from(world.chunks.keys())) { const c = world.chunks.get(k); if (c) c.dirty = true; }
+  newWorld(world.seed);
+  toast('Saved edits cleared');
+});
+$('btnLink').addEventListener('click', () => {
+  const u = location.origin + location.pathname + '#seed=' + world.seed;
+  navigator.clipboard?.writeText(u).then(() => toast('Link copied'), () => toast(u));
+});
+$('rd').addEventListener('input', (e) => {
+  renderDist = +e.target.value; $('rdv').textContent = renderDist;
+  settings.renderDist = renderDist; saveSettings();
+});
+$('tod').addEventListener('input', (e) => { timeOfDay = +e.target.value / 1000; });
+$('cyc').addEventListener('change', (e) => { cycle = e.target.checked; settings.cycle = cycle; saveSettings(); });
+
+/* ==================== go ==================== */
+/* Boot is staged across frames so the progress bar moves and the tab never
+   looks hung: world, chunks in slices, then each set piece. */
+async function boot() {
+  bootMsg('reading settings…', 0.10);
+  $('seedIn').value = seed;
+  $('qual').value = settings.quality;
+  $('gfx').checked = settings.gfx; POST.enabled = Q.post && settings.gfx;
+  $('mus').checked = settings.sound; audio.on = settings.sound;
+  $('strobe').checked = settings.strobe;
+  $('mapOn').checked = settings.map; setNavUI(settings.map);
+  $('cyc').checked = cycle;
+  $('verTag').textContent = VERSION + (TESTMODE ? ' test' : '');
+  setHashSeed();
+  edits.load();
+  await nextFrame();
+  bootMsg('carving the archipelago…', 0.18);
+  spawn();
+  rdEff = clamp(Math.round(renderDist + smoothstep(SEA + 40, SEA + 150, player.pos.y + player.EYE) * 4), 3, 13);
+  await nextFrame();
+  // chunk warm-up in slices, reporting progress by queue depth
+  const t0 = performance.now();
+  let guard = 0, maxQ = 1;
+  while (guard++ < 60) {
+    updateChunks(player.pos.x, player.pos.z);
+    const q = genQueue.length + meshQueue.length;
+    maxQ = Math.max(maxQ, q);
+    if (!q) break;
+    pumpQueues(60);
+    bootMsg('carving the archipelago… ' + Math.round((1 - q / maxQ) * 100) + '%', 0.18 + 0.42 * (1 - q / maxQ));
+    await nextFrame();
+    if (performance.now() - t0 > 6000) break;
+  }
+  bootMsg('raising the rave…', 0.62); await nextFrame(); buildRave();
+  bootMsg('lighting the way…', 0.72); await nextFrame(); buildGuide(); buildUFOs(); buildSatellite(); buildLift();
+  bootMsg('waking the city…', 0.82); await nextFrame(); buildResidents(); buildWildlife();
+  bootMsg('final checks…', 0.92); await nextFrame();
+  quest.load();
+  compass.init(); minimap.init();
+  drawHotbar();
+  $('rd').value = renderDist; $('rdv').textContent = renderDist;
+  $('tod').value = Math.round(timeOfDay * 1000);
+  $('kbd').style.display = isTouch ? 'none' : 'block';
+  $('tch').style.display = isTouch ? 'block' : 'none';
+  buildPost();
+  bootMsg('ready', 1);
+}
+
+/* Automation / power-user hook: lets tooling drive the world headlessly and
+   lets a user jump around from the console. Read-only accessors + teleport. */
+window.ATOLL = {
+  version: VERSION,
+  get player() { return player; },
+  get world() { return world; },
+  get chunkCount() { return built.size; },
+  camera, scene, renderer,
+  setPaused, warmup, newWorld,
+  teleport(x, y, z, yaw, pitch) {
+    player.pos.set(x, y, z); player.vel.set(0, 0, 0);
+    if (yaw !== undefined) player.yaw = yaw;
+    if (pitch !== undefined) player.pitch = pitch;
+    camera.position.set(x, y + player.EYE, z);
+    camera.rotation.set(player.pitch, player.yaw, 0, 'YXZ');
+    warmup(600);
+  },
+  setTime(t) { timeOfDay = t; cycle = false; $('cyc').checked = false; },
+  surfaceAt(x, z) { world.ensure(x >> 4, z >> 4); return world.topOpaque(x, z); },
+  get paused() { return paused; },
+  get locked() { return document.pointerLockElement === canvas; },
+  get rave() { return world.rave; },
+  get city() { return world.city; },
+  gotoCity() { gotoCity(); },
+  gotoRave() { gotoRave(); },
+  gotoOverlook() { gotoOverlook(); },
+  get crowd() { return raveGroup ? raveGroup.children.length : 0; },
+  raveEnergy,
+  POST,
+  get post() { return post; },
+  get lift() { return lift; },
+  ridePlatform,
+  get satellite() { return sat; },
+  get residents() { return residents ? residents.userData.count : 0; },
+  get ufos() { return ufos; },
+  get spawnHouse() { return spawnHouse; },
+  get portal() { return world.portal; },
+  enterPortal,
+  get portalArmed() { return portalArmed; },
+  get fx() { return fx; },
+  get aerie() { return world.aerie; },
+  get lighthouse() { return world.lighthouse; },
+  get wildlife() { return wild; },
+  get quest() { return quest; },
+  get settings() { return settings; },
+  get Q() { return Q; },
+  gotoAerie() { gotoAerie(); },
+  jumpPressed, spawn, edits, faceYaw, bearingName,
+  audio
+};
+
+await boot();
+window.__atollBooted = true;
+$('boot').style.display = 'none';
+setPaused(true);
+requestAnimationFrame(frame);
+
+
