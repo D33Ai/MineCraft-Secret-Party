@@ -1,0 +1,36 @@
+{
+  "name": "minecraft-secret-party",
+  "version": "2.0.0",
+  "description": "ATOLL — a single-file browser voxel archipelago with a secret rave buried in the volcano.",
+  "type": "module",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "build": "node scripts/build.mjs",
+    "check": "node --check src/game.mjs && node scripts/build.mjs --check",
+    "test": "node tests/smoke.mjs",
+    "test:desktop": "node tests/smoke.mjs --desktop",
+    "test:mobile": "node tests/smoke.mjs --mobile",
+    "fetch-engine": "node scripts/fetch-engine.mjs",
+    "test:offline": "node scripts/fetch-engine.mjs && node tests/smoke.mjs --offline"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/D33Ai/MineCraft-Secret-Party.git"
+  },
+  "keywords": [
+    "voxel",
+    "threejs",
+    "webgl",
+    "procedural-generation",
+    "browser-game",
+    "single-file"
+  ]
+}

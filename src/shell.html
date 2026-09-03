@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0b1a2e" />
+<title>ATOLL · Voxel Archipelago</title>
+<style>
+  :root{
+    --navy:#0b1a2e; --navy2:#15334a; --gold:#d4a138; --ink:#e8eef5; --dim:#9fb0c2;
+    --teal:#22d3ee; --pink:#ff2f8e;
+    --pad: env(safe-area-inset-bottom, 0px);
+    --top: env(safe-area-inset-top, 0px);
+    --panel: rgba(11,26,46,.55);
+    --line: rgba(232,238,245,.14);
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;height:100%;overflow:hidden;background:#0b1a2e;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink);}
+  canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;}
+
+  /* ---------- HUD ---------- */
+  #hud{position:fixed;inset:0;pointer-events:none;transition:opacity .18s;}
+  body.photo #hud, body.photo #touch{opacity:0 !important;}
+  #crosshair{position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;opacity:.85;}
+  #crosshair:before,#crosshair:after{content:"";position:absolute;background:#fff;
+    box-shadow:0 0 2px rgba(0,0,0,.9);}
+  #crosshair:before{left:9px;top:2px;width:2px;height:16px;}
+  #crosshair:after{top:9px;left:2px;height:2px;width:16px;}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;backdrop-filter:blur(8px);}
+  #stats{position:absolute;top:calc(10px + var(--top));left:12px;
+    font:500 11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    padding:6px 10px;max-width:min(560px, calc(50vw - 170px));}
+  #stats b{color:var(--gold);font-weight:600;}
+  #stats .zone{color:var(--ink);letter-spacing:.08em;}
+  #stats .cue{color:#ff5fb0;}
+  #objLine{display:none;margin-top:3px;color:var(--dim);font-size:10.5px;}
+  #objLine b{color:var(--teal);}
+
+  #compass{position:absolute;left:50%;top:calc(10px + var(--top));transform:translateX(-50%);
+    width:min(300px, calc(100vw - 560px));height:36px;overflow:hidden;}
+  #compass canvas{width:100%;height:100%;display:block;}
+
+  #right{position:absolute;right:12px;top:calc(10px + var(--top));display:flex;flex-direction:column;align-items:flex-end;gap:8px;}
+  #minimap{width:150px;height:150px;padding:4px;overflow:hidden;position:relative;}
+  #minimap canvas{width:100%;height:100%;display:block;border-radius:5px;image-rendering:auto;}
+  #minimap .lbl{position:absolute;left:8px;bottom:6px;font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);text-shadow:0 1px 2px #000;}
+  #quest{width:236px;padding:8px 10px 6px;font-size:11.5px;line-height:1.5;}
+  #quest h4{margin:0 0 4px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--gold);font-weight:600;}
+  #quest ol{margin:0;padding:0;list-style:none;}
+  #quest li{display:flex;gap:7px;align-items:flex-start;color:var(--dim);padding:2px 0;}
+  #quest li .k{flex:0 0 14px;height:14px;margin-top:2px;border-radius:4px;border:1px solid rgba(232,238,245,.35);font-size:9px;line-height:12px;text-align:center;color:transparent;}
+  #quest li.done{color:#7d8ea1;text-decoration:line-through;}
+  #quest li.done .k{background:rgba(53,208,127,.28);border-color:#35d07f;color:#8ff0b8;}
+  #quest li.now{color:var(--ink);}
+  #quest li.now .k{border-color:var(--teal);box-shadow:0 0 8px rgba(34,211,238,.45);}
+  #quest li .p{color:var(--teal);margin-left:auto;font:600 10px ui-monospace,Menlo,monospace;}
+
+  #barwrap{position:absolute;left:50%;transform:translateX(-50%);
+    bottom:calc(14px + var(--pad));display:flex;flex-direction:column;align-items:center;gap:6px;}
+  #blockName{font-size:12px;letter-spacing:.10em;text-transform:uppercase;color:var(--ink);
+    text-shadow:0 1px 6px rgba(0,0,0,.8);}
+  #hotbar{display:flex;gap:clamp(2px,0.8vw,5px);padding:5px;border-radius:12px;max-width:calc(100vw - 12px);
+    background:var(--panel);border:1px solid var(--line);backdrop-filter:blur(8px);
+    pointer-events:auto;}
+  .slot{position:relative;flex:0 0 auto;width:clamp(26px,calc((100vw - 76px)/10),42px);height:clamp(26px,calc((100vw - 76px)/10),42px);
+    border-radius:8px;background-color:rgba(232,238,245,.06);background-repeat:no-repeat;background-position:center;
+    background-size:72% 72%;image-rendering:pixelated;border:1.5px solid transparent;cursor:pointer;overflow:hidden;}
+  .slot.on{border-color:var(--gold);background:rgba(212,161,56,.16);}
+  .slot span{position:absolute;right:2px;bottom:0;font-size:8.5px;color:var(--dim);text-shadow:0 1px 2px #000;}
+
+  #lockHint{position:absolute;left:50%;top:50%;transform:translate(-50%,42px);display:none;
+    font-size:13px;letter-spacing:.05em;background:rgba(11,26,46,.8);padding:9px 16px;border-radius:22px;
+    border:1px solid rgba(212,161,56,.55);white-space:nowrap;pointer-events:none;}
+  #lockHint b{color:var(--gold);}
+  #glideHint{position:absolute;left:50%;top:58%;transform:translateX(-50%);opacity:0;transition:opacity .25s;
+    font-size:13px;letter-spacing:.12em;text-transform:uppercase;background:rgba(11,26,46,.7);padding:8px 16px;border-radius:22px;
+    border:1px solid rgba(34,211,238,.6);white-space:nowrap;}
+  #glideHint b{color:var(--teal);}
+  #toast{position:absolute;left:50%;top:calc(58px + var(--top));transform:translateX(-50%);opacity:0;
+    font-size:13px;letter-spacing:.04em;background:rgba(11,26,46,.72);padding:7px 14px;border-radius:20px;
+    border:1px solid rgba(212,161,56,.4);transition:opacity .2s;white-space:nowrap;max-width:calc(100vw - 24px);overflow:hidden;text-overflow:ellipsis;}
+  #vign{position:absolute;inset:0;opacity:0;pointer-events:none;
+    background:radial-gradient(70% 70% at 50% 50%, rgba(0,0,0,0) 55%, rgba(6,18,30,.55) 100%);transition:opacity .4s;}
+
+  /* ---------- menu ---------- */
+  #menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(120% 90% at 50% 0%,rgba(21,51,74,.86),rgba(6,13,24,.94));
+    backdrop-filter:blur(10px);z-index:20;padding:20px;overflow:auto;}
+  .card{width:min(470px,100%);background:rgba(11,26,46,.84);border:1px solid rgba(212,161,56,.34);
+    border-radius:16px;padding:22px;box-shadow:0 24px 70px rgba(0,0,0,.55);}
+  .card h1{margin:0;font-family:Georgia,"Times New Roman",serif;font-size:30px;letter-spacing:.16em;font-weight:400;display:flex;align-items:baseline;gap:10px;}
+  .card h1 span{color:var(--gold);}
+  .card h1 small{font:500 10px ui-monospace,Menlo,monospace;letter-spacing:.14em;color:#7d8ea1;margin-left:auto;}
+  .sub{margin:5px 0 16px;font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);}
+  .rule{height:1px;background:linear-gradient(90deg,var(--gold),rgba(212,161,56,0));margin:14px 0;}
+  .row{display:flex;gap:8px;align-items:center;margin:9px 0;font-size:13px;}
+  .row label{flex:0 0 108px;color:var(--dim);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;}
+  .row .note{color:var(--dim);font-size:12px;}
+  input[type=text],input[type=number],select{flex:1;min-width:0;background:rgba(232,238,245,.07);color:var(--ink);
+    border:1px solid rgba(232,238,245,.18);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;}
+  select option{background:#15334a;color:var(--ink);}
+  input[type=range]{flex:1;accent-color:var(--gold);min-width:0;}
+  input[type=checkbox]{accent-color:var(--gold);width:16px;height:16px;flex:0 0 auto;}
+  button{background:rgba(232,238,245,.08);color:var(--ink);border:1px solid rgba(232,238,245,.2);
+    border-radius:9px;padding:9px 14px;font:inherit;font-size:13px;cursor:pointer;transition:.15s;}
+  button:hover{background:rgba(212,161,56,.2);border-color:var(--gold);}
+  button.sm{padding:6px 10px;font-size:12px;}
+  #btnPlay{width:100%;padding:13px;font-size:15px;letter-spacing:.1em;text-transform:uppercase;
+    background:linear-gradient(180deg,rgba(212,161,56,.34),rgba(212,161,56,.16));border-color:var(--gold);margin-bottom:4px;}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;}
+  .btns button{flex:1;min-width:96px;}
+  .quest{margin:9px 0 2px;padding:9px 11px;border-radius:9px;font-size:12.5px;line-height:1.6;
+    color:var(--dim);background:rgba(34,211,238,.07);border:1px solid rgba(34,211,238,.30);}
+  .quest b{color:var(--teal);}
+  .quest i{color:#ff5fb0;font-style:normal;}
+  .tiers{margin-top:9px;padding:8px 10px;border-radius:8px;font-size:11px;line-height:1.65;color:var(--dim);
+    background:rgba(155,92,255,.10);border:1px solid rgba(155,92,255,.28);}
+  .tiers b{color:#c8a6ff;display:block;letter-spacing:.10em;text-transform:uppercase;font-size:10px;margin-bottom:2px;}
+  .skip{margin-top:13px;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:#7d8ea1;}
+  .keys{font-size:12px;color:var(--dim);line-height:1.85;}
+  .keys kbd{display:inline-block;min-width:19px;text-align:center;background:rgba(232,238,245,.1);
+    border:1px solid rgba(232,238,245,.2);border-bottom-width:2px;border-radius:5px;padding:1px 5px;
+    font:600 11px ui-monospace,Menlo,monospace;color:var(--ink);}
+  .foot{margin-top:14px;font-size:10px;line-height:1.6;color:#7d8ea1;letter-spacing:.02em;}
+  .warn{color:#e0a377;}
+  details.adv summary{cursor:pointer;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#7d8ea1;margin:10px 0 4px;list-style:none;}
+  details.adv summary::-webkit-details-marker{display:none;}
+  details.adv summary:before{content:"▸ ";color:var(--gold);}
+  details.adv[open] summary:before{content:"▾ ";}
+
+  /* ---------- touch ---------- */
+  #touch{display:none;position:fixed;inset:0;pointer-events:none;z-index:10;}
+  #stick{position:absolute;left:22px;bottom:calc(96px + var(--pad));width:124px;height:124px;border-radius:50%;
+    background:rgba(11,26,46,.34);border:1px solid rgba(232,238,245,.2);pointer-events:auto;
+    display:grid;place-items:center;}
+  #knob{width:52px;height:52px;border-radius:50%;background:rgba(232,238,245,.28);
+    border:1px solid rgba(232,238,245,.45);}
+  .tbtn{position:absolute;right:20px;width:66px;height:66px;border-radius:50%;pointer-events:auto;
+    background:rgba(11,26,46,.5);border:1px solid rgba(232,238,245,.22);color:var(--ink);
+    font-size:10.5px;letter-spacing:.08em;display:grid;place-items:center;text-transform:uppercase;user-select:none;}
+  #bJump{bottom:calc(190px + var(--pad));}
+  #bFly{right:96px;bottom:calc(190px + var(--pad));font-size:10px;}
+  #bDown{right:172px;bottom:calc(190px + var(--pad));display:none;}
+  #bMine{bottom:calc(112px + var(--pad));background:rgba(180,70,60,.42);}
+  #bPlace{right:96px;bottom:calc(112px + var(--pad));background:rgba(60,120,90,.42);}
+  #bMenu{right:20px;top:calc(176px + var(--top));width:46px;height:46px;font-size:9px;}
+
+  /* ---------- boot / fault ---------- */
+  #boot,#fault{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:14px;background:#0b1a2e;z-index:50;padding:26px;text-align:center;}
+  #fault{display:none;}
+  .spin{width:34px;height:34px;border:2px solid rgba(232,238,245,.16);border-top-color:var(--gold);
+    border-radius:50%;animation:sp .85s linear infinite;}
+  @keyframes sp{to{transform:rotate(360deg);}}
+  #bootMsg{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);}
+  #bootBar{width:min(260px,70vw);height:3px;background:rgba(232,238,245,.12);border-radius:2px;overflow:hidden;}
+  #bootFill{height:100%;width:0;background:linear-gradient(90deg,var(--gold),var(--teal));transition:width .2s;}
+  #bootTitle{font-family:Georgia,serif;font-size:26px;letter-spacing:.2em;color:var(--ink);}
+  #bootTitle span{color:var(--gold);}
+  #faultTitle{font-family:Georgia,serif;font-size:21px;color:var(--gold);}
+  #faultBody{max-width:460px;font-size:13px;line-height:1.65;color:var(--dim);white-space:pre-wrap;}
+
+  @media (max-width:760px){
+    #compass{display:none;}
+    #minimap{width:104px;height:104px;}
+    #quest{display:none;}
+    #objLine{display:block;}
+    #stats{max-width:calc(100vw - 140px);}
+  }
+  @media (max-width:520px){ .card{padding:18px;} .card h1{font-size:25px;} .row label{flex-basis:88px;} }
+  @media (max-height:520px){ .keys{display:none;} }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div id="vign"></div>
+  <div id="crosshair"></div>
+  <div id="stats" class="panel">booting…<div id="objLine"></div></div>
+  <div id="compass" class="panel"><canvas id="compassCv" width="760" height="72"></canvas></div>
+  <div id="right">
+    <div id="minimap" class="panel"><canvas id="mapCv" width="150" height="150"></canvas><div class="lbl">Map · N up</div></div>
+    <div id="quest" class="panel"><h4>Objectives</h4><ol id="questList"></ol></div>
+  </div>
+  <div id="toast"></div>
+  <div id="lockHint">Click to capture the mouse &nbsp;·&nbsp; <b>Esc</b> releases it</div>
+  <div id="glideHint"><b>Space</b> to open the glider &nbsp;·&nbsp; <b>F</b> to fly</div>
+  <div id="barwrap">
+    <div id="blockName">Sand</div>
+    <div id="hotbar"></div>
+  </div>
+</div>
+
+<div id="touch">
+  <div id="stick"><div id="knob"></div></div>
+  <div class="tbtn" id="bJump">Jump</div>
+  <div class="tbtn" id="bFly">Fly</div>
+  <div class="tbtn" id="bDown">Sink</div>
+  <div class="tbtn" id="bMine">Mine</div>
+  <div class="tbtn" id="bPlace">Place</div>
+  <div class="tbtn" id="bMenu">Menu</div>
+</div>
+
+<div id="menu">
+  <div class="card">
+    <h1>ATOLL<span>.</span><small id="verTag">v2.0</small></h1>
+    <div class="sub">Voxel Archipelago &nbsp;·&nbsp; Reef Coast</div>
+    <button id="btnPlay">Begin on the Aerie</button>
+    <div class="quest">
+      You wake on <b>the Aerie</b>, a ledge floating above the clouds at the top of the world.
+      Walk to the prow, step off, and press <b>Space</b> to open your glider. Ride the wind down through the
+      archipelago to the <i>pink portal on the sea floor</i>. It opens onto the dancefloor. The elevator brings you home.
+    </div>
+    <div class="skip">Or skip ahead:</div>
+    <div class="btns" style="margin-top:6px">
+      <button id="btnAerie" style="background:linear-gradient(90deg,rgba(34,211,238,.22),rgba(212,161,56,.18));border-color:#22d3ee">&#9650; The Aerie</button>
+      <button id="btnOverlook" style="background:linear-gradient(90deg,rgba(155,92,255,.26),rgba(34,211,238,.20));border-color:#9b5cff">&#128065; The Overlook</button>
+      <button id="btnRave" style="background:linear-gradient(90deg,rgba(255,47,142,.24),rgba(34,211,238,.20));border-color:#ff2f8e">&#9834; The Rave</button>
+      <button id="btnCity">&#127796; Sky City</button>
+    </div>
+    <div class="tiers">
+      <b>20 districts, 20 DJs</b> &nbsp;Deep Core &middot; Nether &middot; Mainstage &middot; Water Walk &middot; Jungle Terrace &middot;
+      Frost Ridge VIP &middot; End Zone &middot; Cloud Deck &middot; Aurora Deck &middot; Neon Bazaar &middot; Zenith &middot; and more
+    </div>
+
+    <div class="rule"></div>
+    <div class="row"><label>Seed</label>
+      <input type="text" id="seedIn" inputmode="numeric" />
+      <button id="btnSeed">Load</button>
+    </div>
+    <div class="row"><label>New</label>
+      <div class="btns" style="flex:1">
+        <button id="btnNew">Random world</button>
+        <button id="btnLink">Copy link</button>
+        <button id="btnShot">Screenshot</button>
+      </div>
+    </div>
+    <div class="row"><label>Quality</label>
+      <select id="qual">
+        <option value="auto">Auto (adaptive resolution)</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low (phones, integrated GPUs)</option>
+      </select>
+    </div>
+    <div class="row"><label>View dist</label>
+      <input type="range" id="rd" min="3" max="12" step="1" />
+      <b id="rdv" style="width:18px;text-align:right;color:var(--gold)">8</b>
+    </div>
+    <div class="row"><label>Time</label>
+      <input type="range" id="tod" min="0" max="1000" step="1" />
+    </div>
+    <div class="row"><label>Day cycle</label>
+      <input type="checkbox" id="cyc" checked /><span class="note">10&nbsp;min sun</span>
+    </div>
+    <div class="row"><label>Graphics</label>
+      <input type="checkbox" id="gfx" checked /><span class="note">HDR bloom, filmic grade, caustics</span>
+    </div>
+    <div class="row"><label>Sound</label>
+      <input type="checkbox" id="mus" checked /><span class="note">live set, wind and surf</span>
+    </div>
+    <div class="row"><label>Strobes</label>
+      <input type="checkbox" id="strobe" checked /><span class="note warn">flashing lights at the rave. Turn off if photosensitive</span>
+    </div>
+    <div class="row"><label>Minimap</label>
+      <input type="checkbox" id="mapOn" checked /><span class="note">and compass, objectives</span>
+    </div>
+    <div class="row"><label>Saved build</label>
+      <span class="note" id="saveInfo" style="flex:1">no edits saved for this seed</span>
+      <button class="sm" id="btnClearSave">Clear</button>
+    </div>
+
+    <div class="rule"></div>
+    <div class="keys" id="kbd">
+      <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &nbsp;·&nbsp; <kbd>Shift</kbd> sprint &nbsp;·&nbsp; <kbd>Space</kbd> jump, and <b style="color:var(--ink)">glide</b> when falling<br>
+      <kbd>F</kbd> flight &nbsp;·&nbsp; <kbd>G</kbd> screenshot &nbsp;·&nbsp; <kbd>H</kbd> hide HUD &nbsp;·&nbsp; <kbd>M</kbd> sound &nbsp;·&nbsp; <kbd>R</kbd> rave &nbsp;·&nbsp; <kbd>O</kbd> overlook &nbsp;·&nbsp; <kbd>C</kbd> city &nbsp;·&nbsp; <kbd>T</kbd> aerie &nbsp;·&nbsp; <kbd>P</kbd> graphics &nbsp;·&nbsp; <kbd>Esc</kbd> menu<br>
+      <kbd>1</kbd>..<kbd>9</kbd><kbd>0</kbd> or scroll to pick a block &nbsp;·&nbsp; gamepad supported<br>
+      <b style="color:var(--ink)">Left click</b> break &nbsp;·&nbsp; <b style="color:var(--ink)">Right click</b> place &nbsp;·&nbsp; <b style="color:var(--ink)">Middle</b> pick<br>
+      In flight: <kbd>Space</kbd> rise, <kbd>Shift</kbd> sink. Gliding: look down to dive, look up to float, <kbd>Space</kbd> again to drop.
+      <kbd>Esc</kbd> releases the mouse, a click takes it back.
+    </div>
+    <div class="keys" id="tch" style="display:none">
+      Left pad moves · drag anywhere to look · <b style="color:var(--ink)">Mine</b> holds to dig · <b style="color:var(--ink)">Place</b> taps to build.<br>
+      Falling? Tap <b style="color:var(--ink)">Jump</b> to open the glider. Tap <b style="color:var(--ink)">Fly</b> for flight: Jump becomes <b style="color:var(--ink)">Rise</b> and a <b style="color:var(--ink)">Sink</b> button appears.
+    </div>
+    <div class="foot">
+      Procedural terrain from a seeded gradient-noise field: barrier reef, lagoon, beach and volcanic ridge are emergent, not authored.
+      The Secret Rave is cut into the highest volcanic summit of whatever seed you load. A ring of greatwood trees carries the sky city.
+      The Aerie floats above the elevator shaft. Seabirds, reef fish, fireflies and a lighthouse live where the terrain says they should.
+      Builds are saved in this browser per seed. Cosmetic real-time visualization · stylized free-surface kinematics · not engineering CFD.<br>
+      D33 AI Labs · original procedural art, no third-party game assets.
+    </div>
+  </div>
+</div>
+
+<div id="boot"><div id="bootTitle">ATOLL<span>.</span></div><div class="spin"></div><div id="bootBar"><div id="bootFill"></div></div><div id="bootMsg">starting…</div></div>
+<div id="fault">
+  <div id="faultTitle">Something went wrong</div>
+  <div id="faultBody"></div>
+</div>
+
+<script type="module">
+/*__GAME__*/
+</script>
+</body>
+</html>
